@@ -9,3 +9,4 @@ What changed since the fork, and why. Divergence from upstream is recorded here,
 - Added `phext/STUDY.md` (the study: API contract, census, complexity 967 / cache-ability 93 instrument), `phext/SPARQL-SUBSET.md` (the scoped SPARQL subset determination), `phext/V1-REPORT.md` (v1 comparison: complexity 967 → 397, locked packages 331 → 0, budget verdicts, abstraction plan).
 - The SPARQL subset evaluator does NOT live in this repo: it was abstracted into phext-lattice (`src/sparql.rs`, PR https://github.com/wbic16/phext-lattice/pull/99, merged 2026-11-23).
 - No upstream ravel files modified. Native head-to-head timings remain unmeasured: ravel's Rust build is blocked on repolex-ai git access (calamus/tessera) — see `phext/V1-REPORT.md`.
+- 2026-11-23: phext/verify/ gains wavelets_test.py + README.md — Wavelets 1–3 documented as unit tests in ravel's terms (19/19 passing against the real backend + SQ).
