@@ -1,0 +1,3 @@
+<https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/Turn/z9> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://repolex.ai/ontology/ravel/Turn> <https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/NamedGraph/craft> .
+<https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/Turn/z9> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://repolex.ai/ontology/ravel/Memory> <https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/NamedGraph/craft> .
+<https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/Turn/z9> <https://repolex.ai/ontology/ravel/timestamp> "2026-07-04T00:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> <https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/NamedGraph/craft> .

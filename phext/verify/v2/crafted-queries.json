@@ -1,0 +1,1 @@
+[{"base":"https://repolex.ai/7r1pl3f0rc3/spacegoat/","id":"craft-fanout","sparql":"SELECT ?t WHERE { ?t a <https://repolex.ai/ontology/subtexture/Thing> }"},{"base":"https://repolex.ai/7r1pl3f0rc3/spacegoat/","id":"craft-fanout-graph","sparql":"SELECT ?g ?t WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/subtexture/Thing> } }"}]

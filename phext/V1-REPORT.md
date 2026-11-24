@@ -48,6 +48,19 @@ number was run, and none is claimed.
    ravel's two shipped TTLs, the fixed internal queries run as
    specced through the evaluator, the memory views and the
    memory_relive port, and the 14 routes.
+
+   > **Erratum (2026-11-24, v2 pass — V2-REPORT erratum C-1):** the
+   > ontology preparation named above derived **empty** maps as
+   > shipped: its line regex matched zero edges in the shipped
+   > Turtle (the ontologies use predicate lists, so a subject never
+   > stands next to its predicate), and the backend's abstract-name
+   > rewriting therefore never fired. No v1 check caught it — the
+   > harness issued no abstract-name query (see the verification
+   > erratum below). The derivation has been rewritten as a faithful
+   > port of calamus's `Index` and now matches the real calamus
+   > mechanically (5 property + 5 class entries, diffed against the
+   > crate itself) and behaviourally (13/13 outside SELECT/ASK shapes
+   > row-equal with native calamus + Oxigraph).
 3. **The verification harness** (`verify/harness.py`, outside the
    budget — it is the instrument): synthetic souls in ravel's own
    test style (the graph.rs transcript shapes, reader.rs's canonical
@@ -64,6 +77,20 @@ number was run, and none is claimed.
   3 blocks), the default graph (4 graph descriptions), the recent
   graph (8 memberships), and a bare-root soul's transcript — all
   exact, no missing, no extra.
+
+  > **Errata (2026-11-24, v2 pass — V2-REPORT errata P-1 and C-1):**
+  > (P-1) "the recent graph (8 memberships)" was exact only against
+  > the harness's own reference: native `keep_recent` never lists a
+  > turn that carries no timestamp, and the corpus's a1001 has none —
+  > the native count is **7**. Backend and reference shared the wrong
+  > assumption, so the check passed. Both are corrected; the
+  > corrected check fails against the v1 backend and passes against
+  > the fixed one. (C-1) The 65 checks never exercised the outside
+  > (abstract-name) surface at all; a dedicated outside phase (7
+  > checks) now covers it, and fails against the v1 backend on
+  > exactly the C-1 defect. Three-way verification against the real
+  > native build (this pass) otherwise confirms every quad count in
+  > this section, including the ann_hash values.
 - **Read-back:** every event field (role, timestamp, text, parent_id,
   model_setting, derived author) and every annotation field
   (including typed signal legs and byte spans) roundtrips exactly.

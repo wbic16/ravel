@@ -10,12 +10,19 @@ in STUDY.md and SPARQL-SUBSET.md; the backend's own projector is a
 separate implementation of the same spec, and the two must agree quad
 for quad. Roundtrip gates: events -> phext -> events, quads -> set
 equality per graph, memory logs -> byte-identical JSONL.
+
+v2 (2026-11-24): the reference was verified three-way against the real
+native build (calamus/tessera public) — see V2-REPORT. Two corrections
+landed with that pass: recent membership excludes timestamp-less turns
+(erratum P-1) and the outside phase below now exercises the abstract-
+name surface the v1 harness never queried (erratum C-1).
 """
 import hashlib
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
@@ -436,10 +443,14 @@ def seam_phase():
         ])
         check(got.get(None) == want_desc, "graph descriptions == reference",
               f"\n  missing: {sorted(want_desc - got.get(None, set()))[:4]}\n  extra: {sorted(got.get(None, set()) - want_desc)[:4]}")
-        # recent membership: every turn here is within the 500.
+        # recent membership: native keep_recent (graph.rs) only ever weighs
+        # turns that carry a timestamp — a1001 has none and is never listed.
+        # (v1's construction listed every turn; corrected 2026-11-24, V2
+        # erratum P-1, on three-way evidence against the native build.)
         want_recent = {
             f"{I(f'{ROOT_A}ravel/NamedGraph/recent')} {I('http://www.w3.org/2000/01/rdf-schema#member')} {I(f'{ROOT_A}ravel/Turn/{e['event_id']}')} ."
             for e in EVENTS_A1 + EVENTS_A2
+            if e.get("timestamp") is not None
         }
         g_r = f"{ROOT_A}ravel/NamedGraph/recent"
         check(got.get(g_r) == want_recent, "recent membership == reference")
@@ -652,10 +663,78 @@ def http_phase():
     return timings
 
 
+def outside_phase():
+    """The outside-query surface (calamus preparation, as data): abstract
+    names must find stored spellings. Added 2026-11-24 — v1's harness never
+    issued an abstract-name query, so the empty-prep defect (V2 erratum
+    C-1) passed 65/65 undetected. These checks fail against the v1 backend
+    and pass against the corrected one."""
+    import ravel_backend as rb
+    from phextio import PhextStore
+
+    print("== outside phase ==")
+    SUB = "https://repolex.ai/ontology/subtexture/"
+    data = os.environ.get("HARNESS_DATA3") or tempfile.mkdtemp(prefix="ravel-outside-")
+    store = PhextStore(data, int(os.environ.get("HARNESS_SQ3", "18997")))
+    store.start()
+    try:
+        soul = rb.Soul(store, "soul-a", rb.Names(ROOT_A, "spacegoat"), machine_owner=None).open()
+        soul.ingest_transcript("sess-A", EVENTS_A1, ANNS_A1)
+        soul.ingest_transcript("sess-B", EVENTS_A2, ANNS_A2)
+        for n in NOTES_A:
+            soul.append_note(n)
+        for s in SUMMARIES_A:
+            soul.upsert_summary(s)
+
+        n_related = sum(1 for _g, _s, p, _o in soul.all_quads() if p == ("iri", RAVEL + "relatedToId"))
+        res = soul.run_query(f"SELECT ?s ?o WHERE {{ ?s <{SUB}relatedToId> ?o }}")
+        check(res["kind"] == "solutions" and len(res["rows"]) == n_related and n_related > 0,
+              "outside: abstract property finds stored spellings",
+              f"rows={len(res.get('rows', []))} stored={n_related}")
+
+        res = soul.run_query(f"SELECT ?t WHERE {{ ?t a <{SUB}Thing> }}")
+        check(res["kind"] == "solutions" and len(res["rows"]) == 15,
+              "outside: abstract class fans out (8 turns + 7 memory nodes)",
+              f"rows={len(res.get('rows', []))}")
+
+        res = soul.run_query(f"SELECT ?g ?t WHERE {{ GRAPH ?g {{ ?t a <{SUB}Thing> }} }}")
+        check(res["kind"] == "solutions" and len(res["rows"]) == 15
+              and all("g" in r for r in res["rows"]),
+              "outside: fan-out inside GRAPH ?g keeps ?g bound",
+              f"rows={len(res.get('rows', []))}")
+
+        res = soul.run_query(f"SELECT ?g WHERE {{ ?g a <{RAVEL}NamedGraph> }}")
+        check(res["kind"] == "solutions" and len(res["rows"]) == 4,
+              "outside: stored class fans out to its stored subclasses",
+              f"rows={len(res.get('rows', []))}")
+
+        res = soul.run_query(f"SELECT ?t WHERE {{ ?t a <{RAVEL}Turn> }}")
+        check(res["kind"] == "solutions" and len(res["rows"]) == 8,
+              "outside: stored name asked as written stays exact",
+              f"rows={len(res.get('rows', []))}")
+
+        res = soul.run_query(
+            f"SELECT ?s WHERE {{ ?s ?p ?o . FILTER(?p = <{SUB}author>) }}")
+        check(res["kind"] == "solutions" and len(res["rows"]) == 0
+              and any("subtexture:author" in n for n in res["notes"]),
+              "outside: name in an expression is left as written, with the note",
+              f"rows={len(res.get('rows', []))} notes={res.get('notes')}")
+
+        try:
+            soul.run_query(f"SELECT ?x WHERE {{ <{ROOT_A}ravel/Memory/m0> <{SUB}relatedToId>+ ?x }}")
+            check(False, "outside: property path refused by name", "no Refused raised")
+        except rb.Refused as e:
+            check("propert" in str(e).lower(), "outside: property path refused by name", str(e))
+    finally:
+        store.stop()
+    return {}
+
+
 def main():
     timings = {}
     timings.update(seam_phase())
     timings.update(http_phase())
+    timings.update(outside_phase())
     print("== timings (backend-self, this node) ==")
     for k, v in timings.items():
         print(f"  {k}: {v}")

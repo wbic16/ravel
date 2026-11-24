@@ -366,61 +366,198 @@ def spine_quads(names, graph, ev, machine_owner):
 _PREP = None
 
 
+_RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+_EDGE_KINDS = {
+    "http://www.w3.org/2000/01/rdf-schema#subPropertyOf": ("prop", False),
+    "http://www.w3.org/2002/07/owl#equivalentProperty": ("prop", True),
+    "http://www.w3.org/2000/01/rdf-schema#subClassOf": ("class", False),
+    "http://www.w3.org/2002/07/owl#equivalentClass": ("class", True),
+}
+
+
+def _ttl_tokens(text):
+    """Tokenize Turtle: IRIs, string literals, names, structural ; , . [ ] ( ).
+    Comments (# to end of line) are dropped outside strings and IRIs."""
+    toks, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == "<":
+            j = text.index(">", i)
+            toks.append(("iri", text[i + 1:j]))
+            i = j + 1
+        elif c in "\"'":
+            q = c * 3
+            if text.startswith(q, i):
+                j = text.index(q, i + 3)
+                toks.append(("lit", text[i + 3:j]))
+                i = j + 3
+            else:
+                j = i + 1
+                buf = []
+                while text[j] != c:
+                    if text[j] == "\\":
+                        buf.append(text[j:j + 2])
+                        j += 2
+                    else:
+                        buf.append(text[j])
+                        j += 1
+                toks.append(("lit", "".join(buf)))
+                i = j + 1
+        elif c in ";,.[]()":
+            toks.append((c, c))
+            i += 1
+        elif c == "@":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] in "-_"):
+                j += 1
+            toks.append(("dir", text[i + 1:j]))
+            i = j
+        else:
+            j = i
+            while j < n and text[j] not in " \t\r\n;,.,[]()<>\"'#":
+                j += 1
+            if j == i:  # a lone '.' ends a name token above; guard anyway
+                j = i + 1
+            toks.append(("word", text[i:j]))
+            i = j
+    return toks
+
+
+def _ttl_triples(text, prefixes):
+    """Parse Turtle statements (subject + predicate-object lists) and return
+    (prefixes, [(s, p, o)]) with every term expanded; only triples whose
+    subject and object are named nodes are kept (calamus's build filter)."""
+    toks = _ttl_tokens(text)
+    out = []
+    pos = 0
+
+    def expand(tok):
+        kind, val = tok
+        if kind == "iri":
+            return val
+        if kind == "word":
+            if val == "a":
+                return _RDF_TYPE
+            if ":" in val:
+                p, local = val.split(":", 1)
+                return prefixes.get(p, p + ":") + local
+            return val
+        return None
+
+    def skip_block(pos, open_t, close_t):
+        depth = 0
+        while pos < len(toks):
+            if toks[pos][0] == open_t:
+                depth += 1
+            elif toks[pos][0] == close_t:
+                depth -= 1
+                if depth == 0:
+                    return pos + 1
+            pos += 1
+        return pos
+
+    while pos < len(toks):
+        kind, val = toks[pos]
+        if kind == "dir":  # @prefix p: <iri> .
+            if val in ("prefix", "base") and pos + 2 < len(toks):
+                if val == "prefix":
+                    prefixes[toks[pos + 1][1].rstrip(":")] = toks[pos + 2][1]
+                pos += 3
+                if pos < len(toks) and toks[pos][0] == ".":
+                    pos += 1
+            else:
+                pos += 1
+            continue
+        subj = expand(toks[pos])
+        pos += 1
+        while pos < len(toks):  # predicate-object list
+            if toks[pos][0] == ".":
+                pos += 1
+                break
+            if toks[pos][0] == ";":
+                pos += 1
+                continue
+            pred = expand(toks[pos])
+            pos += 1
+            while pos < len(toks):  # object list
+                if toks[pos][0] == "[":
+                    pos = skip_block(pos, "[", "]")
+                    obj = None
+                elif toks[pos][0] == "(":
+                    pos = skip_block(pos, "(", ")")
+                    obj = None
+                else:
+                    obj = expand(toks[pos])
+                    pos += 1
+                if subj is not None and pred is not None and obj is not None:
+                    out.append((subj, pred, obj))
+                if pos < len(toks) and toks[pos][0] == ",":
+                    pos += 1
+                    continue
+                break
+            if pos < len(toks) and toks[pos][0] == ";":
+                continue
+            if pos < len(toks) and toks[pos][0] == ".":
+                pos += 1
+            break
+    return prefixes, out
+
+
+def _calamus_closure(edges, abstract_prefixes):
+    """calamus ontology.rs closure(): for every name, everything reachable
+    from it (itself included), abstract names dropped, in address order.
+    A name whose stored answer is only itself is left out (asked as written)."""
+    out = {}
+    for start in edges:
+        seen, todo = set(), [start]
+        while todo:
+            name = todo.pop()
+            if name not in seen:
+                seen.add(name)
+                todo.extend(edges.get(name, ()))
+        stored = sorted(x for x in seen if not any(x.startswith(p) for p in abstract_prefixes))
+        if not stored or stored == [start]:
+            continue
+        out[start] = stored
+    return out
+
+
 def ontology_prep():
-    """Derive the evaluator's Prep from ravel's two shipped ontologies:
-    subtexture: names that find ravel: stored spellings (equivalent
-    properties), and the subclass fan-out under abstract classes."""
+    """Derive the evaluator's Prep from ravel's two shipped ontologies.
+
+    A faithful port of calamus's Index (ontology.rs): a property is
+    satisfied by itself, its sub-properties and its equivalents (in either
+    direction, transitively); a class likewise with subClassOf /
+    equivalentClass. Abstract (subtexture:) names are dropped from every
+    answer. Replaces the v1 derivation, whose line regex matched zero
+    edges in the shipped Turtle (the ontologies use predicate lists, so
+    the subject never stands next to the predicate) and silently produced
+    empty maps — see V2-REPORT erratum C-1."""
     global _PREP
     if _PREP is not None:
         return _PREP
     prefixes = {"owl": "http://www.w3.org/2002/07/owl#", "rdfs": "http://www.w3.org/2000/01/rdf-schema#"}
-    edges = []  # (subject, predicate, object) as full IRIs
-
-    def expand(tok):
-        tok = tok.strip().rstrip(".")
-        if tok.startswith("<"):
-            return tok[1:].rstrip(">")
-        if ":" in tok:
-            p, local = tok.split(":", 1)
-            return prefixes.get(p, p + ":") + local
-        return tok
-
+    prop_edges, class_edges = {}, {}
     for fname in ("ravel.ttl", "subtexture.ttl"):
         text = open(os.path.join(ONTOLOGY_DIR, fname)).read()
-        for m in re.finditer(r"@prefix\s+(\w+):\s*<([^>]+)>", text):
-            prefixes[m.group(1)] = m.group(2)
-        for m in re.finditer(
-            r"(<[^>]+>|[\w]+:[\w.\-]+)\s+(owl:equivalentProperty|rdfs:subClassOf)\s+(<[^>]+>|[\w]+:[\w.\-]+)",
-            text,
-        ):
-            edges.append((expand(m.group(1)), expand(m.group(2)), expand(m.group(3))))
-    prop_equiv = {}
-    parents = {}
-    for s, p, o in edges:
-        if p.endswith("equivalentProperty"):
-            for asked, stored in ((s, o), (o, s)):
-                if asked.startswith(ABSTRACT) and not stored.startswith(ABSTRACT):
-                    prop_equiv.setdefault(asked, []).append(stored)
-        else:
-            parents.setdefault(s, []).append(o)
-    class_subs = {}
-    abstract_classes = {o for _, p, o in edges if p.endswith("subClassOf") and o.startswith(ABSTRACT)}
-    abstract_classes |= {c for c in parents if c.startswith(ABSTRACT)}
-    stored_classes = {c for c in parents if not c.startswith(ABSTRACT)}
-    for a in abstract_classes:
-        found = []
-        for c in stored_classes:
-            seen, stack = set(), [c]
-            while stack:
-                x = stack.pop()
-                if x == a:
-                    found.append(c)
-                    break
-                if x not in seen:
-                    seen.add(x)
-                    stack.extend(parents.get(x, []))
-        if found:
-            class_subs[a] = sorted(found)
+        prefixes, triples = _ttl_triples(text, prefixes)
+        for s, p, o in triples:
+            kind = _EDGE_KINDS.get(p)
+            if kind is None:
+                continue
+            edges = prop_edges if kind[0] == "prop" else class_edges
+            edges.setdefault(o, set()).add(s)
+            edges.setdefault(s, set())
+            if kind[1]:  # equivalents point both ways
+                edges.setdefault(s, set()).add(o)
+    prop_equiv = _calamus_closure(prop_edges, [ABSTRACT])
+    class_subs = _calamus_closure(class_edges, [ABSTRACT])
+    prop_equiv.pop(_RDF_TYPE, None)  # calamus: rdf:type is never swapped
     _PREP = (prop_equiv, class_subs)
     return _PREP
 
@@ -795,11 +932,20 @@ class Soul:
         return q
 
     def recent_turns(self, limit=500):
-        """keep_recent, derived: the newest `limit` turns store-wide."""
+        """keep_recent, derived: the newest `limit` turns store-wide.
+
+        Native keep_recent (graph.rs) only ever weighs turns that carry a
+        timestamp: a turn with none is never a candidate, on either the
+        first-build or the incremental path. A turn whose timestamp string
+        is present but unparseable sorts oldest (instant() -> i64::MIN)
+        yet remains a candidate. v1 listed timestamp-less turns too —
+        see V2-REPORT erratum P-1."""
         best = {}
         for tid, _slot in self.registry():
             events, _ = self.read_transcript(tid)
             for ev in events:
+                if ev.get("timestamp") is None:
+                    continue
                 t = self.names.turn(ev["event_id"])
                 when = parse_instant(ev.get("timestamp"))
                 when = when if when is not None else -(2**63)
