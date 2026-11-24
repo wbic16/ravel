@@ -1,0 +1,368 @@
+# =============================================================================
+# SUBTEXTURE BASE ONTOLOGY
+# =============================================================================
+#
+# The foundational base ontology that sits under everything in the Subtexture
+# ecosystem (Pan, Ravel, git-lex, and the kits built above them).
+#
+# LAYER DISCIPLINE: this file is pure base. It declares ZERO application or kit
+# prefixes and never points upward at git-lex:, pan:, or ravel:. Each upper
+# ontology imports `subtexture:`, subclasses `subtexture:Thing` (or `Set` /
+# `NamedGraph`), keeps its own namespace in stored data, and bridges its
+# properties to `subtexture:*` via `owl:equivalentProperty` in its own file.
+#
+# CHANGELOG
+# -----------------------------------------------------------------------------
+# v0.7.0 (2026-11-22, ruled by goodlux): UNIVERSAL AUTHOR ON THING.
+#   (1) + `subtexture:author` (`owl:DatatypeProperty`, domain `subtexture:Thing`,
+#       range `xsd:string`, multi-valued `0..*` — no `maxCardinality` restriction
+#       so co-authored Things list every contributor).
+#   (2) Expected value convention:
+#       - `"{username}-on-{substrate}"` when a runtime model/substrate is known
+#         (e.g. `"tr1pl3x-on-gemini-4-carbon-medium"`, `"s3lk13-on-claude-fable-5-2"`).
+#       - Bare `"{username}"` when no model substrate applies or is known —
+#         including human authors (`"goodlux"`, never `"-on-carbon"` which
+#         collides with model names like `gemini-4-carbon-medium`) and inbound
+#         peer turns where no model was reported (`"spacegoat"`).
+#       - Because canonical usernames are hyphen-free (`^[a-z0-9]+$`), the first
+#         `"-on-"` splits `{username}` and `{substrate}` losslessly. Writers must
+#         never invent hardcoded fallback model names when a session's model
+#         cannot be read; emit bare `"{username}"` instead.
+#   DELIBERATELY NOT DONE: separate `subtexture:substrate` or `subtexture:model`
+#   property on `Thing` (unordered multi-valued sets lose which co-author ran on
+#   which substrate, and `pan:model` names vision enrichment models rather than
+#   speaker substrates).
+#
+# v0.6.0 (2026-11-19, ruled by goodlux): NAMED GRAPH DESCRIPTORS & ACCESS METADATA.
+#   (1) Store-scoped NamedGraph IRIs (https://repolex.ai/{squad}/{user}/{app}/NamedGraph/{id}):
+#       every named graph descriptor lives in its Oxigraph store's unnamed graph
+#       with the graph's own IRI as subject (no sd:name indirection).
+#   (2) Structural classes under `subtexture:NamedGraph`:
+#       + `subtexture:OntologyGraph` — T-box ontology graphs (left unrewritten
+#         by `calamus`).
+#       + `subtexture:DefaultGraph` — graphs included in the store's default
+#         view when a query carries no `GRAPH` clause.
+#   (3) Ownership & access properties on `subtexture:NamedGraph` (`owner` max 1,
+#       `visibility` max 1):
+#       + `subtexture:owner` (`owl:ObjectProperty`, range `subtexture:Thing`) —
+#         the Soul or entity that owns the graph (always allowed).
+#       + `subtexture:visibility` (`owl:DatatypeProperty`, range
+#         `subtexture:VisibilityValue` = `"private" | "shared" | "public"`) —
+#         `"private"` is the safe default when omitted; `"shared"` grants read
+#         access to `readableBy`; `"public"` is world-readable.
+#       + `subtexture:readableBy` (`owl:ObjectProperty`, multi-valued `0..*`) —
+#         Soul or squad IRIs permitted to read the graph when `visibility` is
+#         `"shared"`.
+#
+# v0.5.0 (2026-11-17, ruled by goodlux): PARAMETERIZED QUERIES.
+#   (1) + `subtexture:parameter` (`owl:DatatypeProperty`, domain
+#       `subtexture:Query`, range `xsd:string`, multi-valued `0..*`) — declares
+#       one query parameter per value using `name[:kind][=default]`, where
+#       `name` is the SPARQL variable name without `?`, `kind` is one of
+#       `string`, `integer`, `decimal`, `boolean`, `date`, `dateTime`, or `iri`
+#       (no `kind` means `string` always — never guessed from how a value
+#       looks; `iri` accepts `<ns/Class/id>` or bare `ns/Class/id`), and
+#       `=default` makes the parameter optional with that default value. Values
+#       are bound as typed RDF terms, never substituted as raw text.
+#   (2) Removed the v0.4.0 "zero parameters" constraint from `subtexture:Query`
+#       and `subtexture:sparql` comments; `subtexture:sparql` holds the query
+#       with parameters unbound.
+#
+# v0.4.0 (2026-11-16, ruled by goodlux): QUERIES AND SMART SETS.
+#   (1) + `subtexture:Query` (`rdfs:subClassOf subtexture:Thing`) — a saved
+#       read-only SPARQL 1.1 query as a first-class Thing, inheriting `id`,
+#       `title`, `description`, `abstract`, `cue`, `relatedToId`, `createdDate`,
+#       and `updatedDate` from the base. Cross-store federated queries need no
+#       separate class or target property: an ordinary `Query` whose SPARQL text
+#       uses standard `SERVICE <https://repolex.ai/ontology/.../>` blocks is run
+#       by Syrinx and refused plainly by single-store daemons.
+#   (2) + `subtexture:sparql` (`owl:DatatypeProperty`, domain `subtexture:Query`,
+#       range `xsd:string`, `owl:maxCardinality 1` on `subtexture:Query`) — the
+#       executable SPARQL 1.1 query text verbatim, with zero parameters in v1.
+#       `maxCardinality 1` at the base allows document layers (`git-lex:Query`)
+#       to derive the triple from the markdown body fence without forcing a
+#       duplicate frontmatter key, while graph-only stores (`pan:Query`) tighten
+#       to `owl:cardinality 1` on their own class.
+#   (3) Smart sets via `relatedToId` (ruled by goodlux):
+#       - A `Set` that links a `Query` via `relatedToId` IS a smart set — no
+#         separate boolean flag that could drift out of step.
+#       - At most ONE `Query` per `Set` (`owl:maxQualifiedCardinality 1` on
+#         `subtexture:Set` over `subtexture:relatedToId` to `subtexture:Query`);
+#         a need one query cannot meet points to missing infrastructure rather
+#         than multiple queries on one set.
+#       - No mixing query-computed results and hand-added members in one `Set`;
+#         combine a smart set and a hand set via a collection `Set` (a `Set` of
+#         two or more `Set`s) instead.
+#   DELIBERATELY NOT DONE: query parameters in v1 (future parameterized queries
+#   should follow SHACL-AF pre-bound variable semantics rather than text
+#   substitution); target-store flags on `Query` (`SERVICE` blocks in the SPARQL
+#   text already state which engines a federated query touches).
+#
+# v0.3.0 (2026-11-16, ruled by goodlux): PURE BASE INVERSION & ALL EIGHT UNIVERSALS.
+#   (1) Pure base layering: removed `@prefix git-lex:`, removed the upward
+#       `git-lex:Thing` / `git-lex:NamedGraph` subclass axioms and `git-lex:*`
+#       `owl:equivalentProperty` bridges from this file, and re-ranged
+#       `subtexture:id` and `subtexture:relatedToId` from `git-lex:Thing` to
+#       `subtexture:Thing`. Each app owns its own namespace and declares its
+#       subclassing and `owl:equivalentProperty` bridges in its own ontology.
+#   (2) Eight universal Thing properties at the base: + `subtexture:title`,
+#       + `subtexture:description`, + `subtexture:abstract`, + `subtexture:cue`
+#       join `id`, `relatedToId`, `createdDate`, and `updatedDate` on
+#       `subtexture:Thing`. Document-carrier properties (`fileId`, `substrate`,
+#       `kitManaged`) remain up on `git-lex:Thing`.
+#   (3) Optional `id` at the base (`owl:maxCardinality 1`): `subtexture:Thing`
+#       relaxes `subtexture:id` from `owl:cardinality 1` to `owl:maxCardinality 1`
+#       alongside `title`, `description`, `abstract`, `createdDate`, and
+#       `updatedDate`. Derived Things whose subject IRI IS their identity
+#       (`ravel:Turn`, `ravel:Memory`) never emit a self-loop `id` triple;
+#       layers that emit an explicit `id` triple (`git-lex:Thing`, `pan:Node`)
+#       enforce `owl:cardinality 1` on their own class.
+#   (4) - `subtexture:Sequence`: deleted outright (zero instances anywhere;
+#       `copia:Sequence` retired in copia 0.41.0, Pan sets are unordered, and
+#       Ravel orders transcripts via `parentTurn` + `timestamp` and OptMem via
+#       integer `logStart` / `logEnd`). `subtexture:Set` and
+#       `subtexture:NamedGraph` remain.
+#   DELIBERATELY NOT DONE: adding a set-side `member` property on
+#   `subtexture:Set` (membership lives on the member via `relatedToId`);
+#   rewriting stored app graphs to emit `subtexture:*` predicates directly
+#   (each app owns its namespace and bridges via `owl:equivalentProperty`).
+#
+# v0.2.0 (2026-09-21, ruled by goodlux): NAMED GRAPH VOCABULARY.
+#   (1) + `subtexture:NamedGraph a owl:Class ; rdfs:subClassOf sd:NamedGraph` —
+#   the ecosystem-wide root for typed named graph descriptors in any Subtexture
+#   store (git-lex, Pan, Ravel, etc.), anchored to W3C SPARQL Service
+#   Description `sd:NamedGraph`.
+#
+# v0.1.0 (2026-09-16, ruled by goodlux): FIRST CUT.
+#   (1) + `subtexture:Thing` — the universal root entity with its own identity
+#   and lifetime, independent of the file or record that carries it.
+#   (2) Foundational properties on `subtexture:Thing`: `id`, `createdDate`,
+#   `updatedDate`, and `relatedToId`.
+#   (3) + `subtexture:Set` — an unordered collection of Things.
+# =============================================================================
+
+@prefix subtexture: <https://repolex.ai/ontology/subtexture/> .
+@prefix owl:        <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:        <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:       <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:        <http://www.w3.org/2001/XMLSchema#> .
+@prefix sd:         <http://www.w3.org/ns/sparql-service-description#> .
+
+<https://repolex.ai/ontology/subtexture> a owl:Ontology ;
+    rdfs:label "Subtexture Base Ontology" ;
+    rdfs:comment "The foundational base ontology for the Subtexture ecosystem: Thing, Set, Query, NamedGraph, and the universal Thing properties." ;
+    owl:versionInfo "0.7.0" .
+
+
+# =============================================================================
+# 1. THE UNIVERSAL ENTITY (subtexture:Thing)
+# =============================================================================
+# A Thing is an entity with its own identity and lifetime, independent of any
+# file or carrier. Authored document classes (via git-lex:Thing) and derived
+# graph-only classes (Pan's pan:Node, Ravel's Turn and Memory) are all Things.
+#
+# Each application owns its own namespace in stored data (`pan:*`, `ravel:*`,
+# `git-lex:*`) and bridges its universal properties to `subtexture:*` via
+# `owl:equivalentProperty` in its own ontology file.
+# =============================================================================
+
+subtexture:Thing a owl:Class ;
+    rdfs:label "Thing" ;
+    rdfs:comment "Universal root entity with its own identity and lifetime, independent of any file or store." .
+
+
+# --- The Nine Universal Properties on Thing ----------------------------------
+
+subtexture:id a owl:ObjectProperty ;
+    rdfs:label "id" ;
+    rdfs:comment "Which Thing this node IS, written <namespace/Class/identifier>; never write a bare token." ;
+    rdfs:domain subtexture:Thing ;
+    rdfs:range subtexture:Thing .
+
+subtexture:title a owl:DatatypeProperty ;
+    rdfs:label "title" ;
+    rdfs:comment "One short display name for this Thing. Single-valued — overwrite it, do not repeat the key." ;
+    rdfs:domain subtexture:Thing ;
+    rdfs:range xsd:string .
+
+subtexture:description a owl:DatatypeProperty ;
+    rdfs:label "description" ;
+    rdfs:comment "CURATED — a short deliberate summary software may read. Single-valued — do not repeat the key." ;
+    rdfs:domain subtexture:Thing ;
+    rdfs:range xsd:string .
+
+subtexture:abstract a owl:DatatypeProperty ;
+    rdfs:label "abstract" ;
+    rdfs:comment "GENERATED — machine summary automation may overwrite; for a curated summary use description." ;
+    rdfs:domain subtexture:Thing ;
+    rdfs:range xsd:string .
+
+subtexture:cue a owl:DatatypeProperty ;
+    rdfs:label "cue" ;
+    rdfs:comment "WHEN to reach for this Thing — name a moment with a verb, not a topic; do not repeat the key." ;
+    rdfs:domain subtexture:Thing ;
+    rdfs:range xsd:string .
+
+subtexture:relatedToId a owl:ObjectProperty ;
+    rdfs:label "relatedToId" ;
+    rdfs:comment "Another Thing this one relates to, written <namespace/Class/identifier>; do not repeat the key." ;
+    rdfs:domain subtexture:Thing ;
+    rdfs:range subtexture:Thing .
+
+subtexture:createdDate a owl:DatatypeProperty ;
+    rdfs:label "createdDate" ;
+    rdfs:comment "When this Thing was first created, ISO-8601 dateTime with offset; do not write a bare date." ;
+    rdfs:domain subtexture:Thing ;
+    rdfs:range xsd:dateTime .
+
+subtexture:updatedDate a owl:DatatypeProperty ;
+    rdfs:label "updatedDate" ;
+    rdfs:comment "When this Thing last changed, ISO-8601 dateTime with offset; maintained by the writer, do not hand-edit." ;
+    rdfs:domain subtexture:Thing ;
+    rdfs:range xsd:dateTime .
+
+# Expected values for `subtexture:author`:
+#   - `"{username}-on-{substrate}"` when the runtime model/substrate is known
+#     (e.g. `"tr1pl3x-on-gemini-4-carbon-medium"`, `"s3lk13-on-claude-fable-5-2"`).
+#   - Bare `"{username}"` when no model substrate applies or is known — always
+#     bare for humans (`"goodlux"`, never `"-on-carbon"`) and when a harness or
+#     peer header reports no model (`"spacegoat"`). Never guess or hardcode a
+#     fallback model id.
+#   - Canonical usernames are hyphen-free (`^[a-z0-9]+$`), so the first `"-on-"`
+#     splits `{username}` and `{substrate}` without ambiguity. To query an agent
+#     across all substrates: `FILTER(?a = "s3lk13" || STRSTARTS(?a, "s3lk13-on-"))`.
+#   - Self-reported / session-populated `xsd:string` convention, not cryptographic
+#     proof; multi-valued (`0..*`) so co-authors may all be recorded.
+subtexture:author a owl:DatatypeProperty ;
+    rdfs:label "author" ;
+    rdfs:comment "Who authored this: '{username}-on-{substrate}' when model is known, or bare '{username}' (humans or unknown model); multi-valued — do not repeat the key." ;
+    rdfs:domain subtexture:Thing ;
+    rdfs:range xsd:string .
+
+
+# =============================================================================
+# 2. COLLECTIONS
+# =============================================================================
+# Hand-curated membership is written on the member via `relatedToId`, never as
+# a set-side `member` list, so membership travels with the member record.
+#
+# Smart sets (ruled by goodlux): a Set that links a Query via `relatedToId` IS
+# a smart set, with at most ONE Query per Set (`owl:maxQualifiedCardinality 1`
+# below). Never mix query results and hand-added members in one Set; combine a
+# smart set and a hand set via a collection Set (a Set of Sets) instead.
+# =============================================================================
+
+subtexture:Set a owl:Class ;
+    rdfs:subClassOf subtexture:Thing ;
+    rdfs:label "Set" ;
+    rdfs:comment "An unordered collection of Things; link hand members from the member via relatedToId, or link at most one Query on the Set for a smart set." .
+
+
+# =============================================================================
+# 3. QUERIES
+# =============================================================================
+# A saved SPARQL 1.1 read query as a first-class Thing. Cross-store federated
+# queries use standard SPARQL `SERVICE <https://repolex.ai/ontology/.../>`
+# blocks inside `subtexture:sparql` (evaluated by Syrinx; refused plainly by
+# single-store daemons), requiring no separate subclass or target-store field.
+# Parameters are declared via `subtexture:parameter` as `name[:kind][=default]`
+# and bound as typed RDF terms (never pasted as text).
+# =============================================================================
+
+subtexture:Query a owl:Class ;
+    rdfs:subClassOf subtexture:Thing ;
+    rdfs:label "Query" ;
+    rdfs:comment "A saved read-only SPARQL 1.1 query; single-store or federated via SERVICE blocks, optionally parameterized via parameter." .
+
+subtexture:sparql a owl:DatatypeProperty ;
+    rdfs:label "sparql" ;
+    rdfs:comment "Executable SPARQL 1.1 query string with parameters unbound; single-valued — overwrite it, do not repeat the key." ;
+    rdfs:domain subtexture:Query ;
+    rdfs:range xsd:string .
+
+subtexture:parameter a owl:DatatypeProperty ;
+    rdfs:label "parameter" ;
+    rdfs:comment "One query parameter as name[:kind][=default] (kinds: string, integer, decimal, boolean, date, dateTime, iri); multi-valued." ;
+    rdfs:domain subtexture:Query ;
+    rdfs:range xsd:string .
+
+
+# =============================================================================
+# 4. GRAPHS & ACCESS METADATA
+# =============================================================================
+# Every Oxigraph store's unnamed graph holds one descriptor per named graph in
+# that store, using the store-scoped graph IRI itself as subject
+# (`https://repolex.ai/{squad}/{user}/{app}/NamedGraph/{id}`, no sd:name).
+# Structural role is expressed by subclassing (`OntologyGraph`, `DefaultGraph`);
+# ownership and read access are expressed via `owner`, `visibility` ('private'
+# default when omitted, 'shared', 'public'), and `readableBy`. Each engine
+# emits its own namespace terms and bridges upward here.
+# =============================================================================
+
+subtexture:NamedGraph a owl:Class ;
+    rdfs:subClassOf sd:NamedGraph ;
+    rdfs:label "NamedGraph" ;
+    rdfs:comment "A named graph descriptor in a Subtexture Oxigraph store's unnamed graph; its subject IRI IS the named graph IRI." .
+
+subtexture:OntologyGraph a owl:Class ;
+    rdfs:subClassOf subtexture:NamedGraph ;
+    rdfs:label "Ontology graph" ;
+    rdfs:comment "A named graph holding T-box ontology statements rather than A-box store data; query rewriters read it as written." .
+
+subtexture:DefaultGraph a owl:Class ;
+    rdfs:subClassOf subtexture:NamedGraph ;
+    rdfs:label "Default graph" ;
+    rdfs:comment "A named graph included in the store's default view for queries with no GRAPH clause." .
+
+subtexture:VisibilityValue a rdfs:Datatype ;
+    owl:oneOf ("private" "shared" "public") .
+
+subtexture:owner a owl:ObjectProperty ;
+    rdfs:label "owner" ;
+    rdfs:comment "The Soul or entity that owns this named graph; always permitted access." ;
+    rdfs:domain subtexture:NamedGraph ;
+    rdfs:range subtexture:Thing .
+
+subtexture:visibility a owl:DatatypeProperty ;
+    rdfs:label "visibility" ;
+    rdfs:comment "Access policy for this named graph: 'private' (owner only, default when omitted), 'shared' (owner plus readableBy), or 'public'." ;
+    rdfs:domain subtexture:NamedGraph ;
+    rdfs:range subtexture:VisibilityValue .
+
+subtexture:readableBy a owl:ObjectProperty ;
+    rdfs:label "readableBy" ;
+    rdfs:comment "A Soul or squad Thing permitted to read this named graph when visibility is 'shared'; multi-valued." ;
+    rdfs:domain subtexture:NamedGraph ;
+    rdfs:range subtexture:Thing .
+
+
+# =============================================================================
+# 5. CARDINALITY
+# =============================================================================
+# Single-valued universals carry `owl:maxCardinality 1` at the base (`cue`,
+# `author`, and `relatedToId` are multi-valued, 0..*). `id` is `maxCardinality 1` here rather
+# than `cardinality 1` so derived Things whose subject IRI IS their identity
+# (`ravel:Turn`, `ravel:Memory`) need no redundant self-loop triple; layers
+# that write an explicit `id` triple (`git-lex:Thing`, `pan:Node`) tighten it
+# to `owl:cardinality 1` on their own class. Likewise `sparql` is
+# `maxCardinality 1` at the base so document carriers (`git-lex:Query`) can
+# derive it from the markdown body fence without requiring a frontmatter key.
+# =============================================================================
+
+subtexture:Thing rdfs:subClassOf
+    [ a owl:Restriction ; owl:onProperty subtexture:id          ; owl:maxCardinality 1 ] ,
+    [ a owl:Restriction ; owl:onProperty subtexture:title       ; owl:maxCardinality 1 ] ,
+    [ a owl:Restriction ; owl:onProperty subtexture:description ; owl:maxCardinality 1 ] ,
+    [ a owl:Restriction ; owl:onProperty subtexture:abstract    ; owl:maxCardinality 1 ] ,
+    [ a owl:Restriction ; owl:onProperty subtexture:createdDate ; owl:maxCardinality 1 ] ,
+    [ a owl:Restriction ; owl:onProperty subtexture:updatedDate ; owl:maxCardinality 1 ] .
+
+subtexture:Set rdfs:subClassOf
+    [ a owl:Restriction ; owl:onProperty subtexture:relatedToId ; owl:onClass subtexture:Query ; owl:maxQualifiedCardinality 1 ] .
+
+subtexture:Query rdfs:subClassOf
+    [ a owl:Restriction ; owl:onProperty subtexture:sparql ; owl:maxCardinality 1 ] .
+
+subtexture:NamedGraph rdfs:subClassOf
+    [ a owl:Restriction ; owl:onProperty subtexture:owner      ; owl:maxCardinality 1 ] ,
+    [ a owl:Restriction ; owl:onProperty subtexture:visibility ; owl:maxCardinality 1 ] .
