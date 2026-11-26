@@ -671,11 +671,70 @@ class Soul:
     # -- the store seam: ingest / append ----------------------------------
     def ingest_transcript(self, tid, events, annotations, append=False):
         with self.store.batch(self.file):
-            return self._ingest_transcript_impl(tid, events, annotations, append=append)
+            result = self._ingest_transcript_impl(tid, events, annotations, append=append)
+        self._holo_eager_sync({tid})
+        return result
+
+    def _primed_transcript(self, events, annotations):
+        """The (events, annotations) read_transcript would return for a
+        transcript written from these inputs — _write_event's scrolls
+        read back through _read_event / _read_annotations, field for
+        field: the author is the derived author as stored (None when no
+        author scroll was written); an optional field survives only when
+        a non-empty scroll was written for it; claims carry only the
+        five stored keys; annotation signals stand in sorted-key order
+        as (kind, lexical) tuples; annotations are grouped under their
+        event, in event order (orphans are never written, so never
+        read back)."""
+        by_event = {}
+        for a in annotations:
+            by_event.setdefault(a["event_id"], []).append(a)
+        evs, anns = [], []
+        for ev in events:
+            stored = {
+                "event_id": ev["event_id"],
+                "author": derive_author(ev, self.names, self.machine_owner) or None,
+            }
+            for key in ("role", "model_setting", "timestamp", "text", "parent_id"):
+                if ev.get(key):
+                    stored[key] = ev[key]
+            if ev.get("role") == "user":
+                claims_in = herdr_claims(ev.get("text")) or {}
+                claims = {
+                    k: claims_in[k]
+                    for k in ("from", "pane", "session", "soul", "user")
+                    if claims_in.get(k)
+                }
+                if claims:
+                    stored["claims"] = claims
+            evs.append(stored)
+            for a in by_event.get(ev["event_id"], []):
+                signal = {}
+                for key in sorted(a["signal"]):
+                    kind, lexical = a["signal"][key]
+                    signal[key] = (kind, lexical)
+                anns.append(
+                    {
+                        "reader": a["reader"] or None,
+                        "event_type": a["event_type"] or None,
+                        "event_id": a["event_id"],
+                        "start": int(a["start"]),
+                        "end": int(a["end"]),
+                        "source_kind": a.get("source_kind") or None,
+                        "ts": a.get("ts") or None,
+                        "signal": signal,
+                    }
+                )
+        return evs, anns
 
     def _ingest_transcript_impl(self, tid, events, annotations, append=False):
         slot = self._slot_of(tid, create=True)
         vol = slot + 2
+        # Holo priming for the append path needs the pre-write read-back
+        # form; capture it before any scroll of this transcript moves.
+        old_events, old_anns = (
+            self.read_transcript(tid) if (append and self._is_holo) else ([], [])
+        )
         if append:
             start = len(self._books(vol))
         else:
@@ -701,7 +760,17 @@ class Soul:
                 quads += len(annotation_quads(self.names, f"{self.names.root}ravel/", self.names.graph(tid), tid, a))
         for sec, val in ((1, len(events)), (2, len(annotations)), (3, quads)):
             self.store.write(self.file, coord(3, vol, 1, 1, sec, 1), str(val))
-        self._invalidate_tid(tid)
+        if self._is_holo:
+            # Prime, don't invalidate: the cache now holds exactly what
+            # read_transcript would read back for this write, so the
+            # eager sync (and every later derivation) needs no re-read.
+            primed_events, primed_anns = self._primed_transcript(events, annotations)
+            if append:
+                primed_events = old_events + primed_events
+                primed_anns = old_anns + primed_anns
+            self._transcript_cache[tid] = (primed_events, primed_anns)
+        else:
+            self._invalidate_tid(tid)
         self._dirty = True
         return {"turns": len(events), "annotations": len(annotations), "quads": quads}
 
@@ -838,7 +907,9 @@ class Soul:
 
     def append_note(self, note):
         with self.store.batch(self.file):
-            return self._append_note_impl(note)
+            result = self._append_note_impl(note)
+        self._holo_eager_sync(set())
+        return result
 
     def _append_note_impl(self, note):
         book = len(self._books(1, lib=2)) + 1
@@ -867,7 +938,9 @@ class Soul:
 
     def upsert_summary(self, s):
         with self.store.batch(self.file):
-            return self._upsert_summary_impl(s)
+            result = self._upsert_summary_impl(s)
+        self._holo_eager_sync(set())
+        return result
 
     def _upsert_summary_impl(self, s):
         span = optmem.parse_block(s["block"])
@@ -1144,6 +1217,86 @@ class Soul:
             self._holo_in_sync = False
         return sections, ordered
 
+    def _holo_post_diff(self, fresh):
+        """POST the add/remove diff between fresh section line-sets and
+        the last-sent sets, adopt the fresh sets, and drop sections of
+        transcripts that have vanished from the registry."""
+        add, remove = [], []
+        for k, new in fresh.items():
+            old = self._holo_sections.get(k, set())
+            add += sorted(new - old)
+            remove += sorted(old - new)
+            self._holo_sections[k] = new
+        live = {tid for tid, _s in self.registry()}
+        for k in list(self._holo_sections):
+            if k != "__global__" and k not in live:
+                remove += sorted(self._holo_sections.pop(k))
+        if add or remove:
+            payload = {}
+            if add:
+                payload["add"] = add
+            if remove:
+                payload["remove"] = remove
+            self.store.quads(self.file, payload)
+
+    def _holo_eager_sync(self, tids):
+        """Holo only: move the quad derivation for our own just-committed
+        write to write time, so the next query pays only the seq poll
+        (a no-op) plus the bridge /query. Derives the affected
+        transcripts from their (primed) read caches plus the global
+        section, posts the diff, and advances _holo_seq past our own
+        commit. Commits in the feed that are not ours (an external
+        writer touching another transcript) keep the poll path's
+        behaviour: that transcript's cache is dropped and it alone is
+        re-derived, here at write time. On any failure the sync state
+        is marked for a full replace and the error propagates; the
+        write itself has already committed."""
+        if not self._is_holo:
+            return
+        try:
+            if not self._holo_synced or self._holo_needs_replace:
+                self._holo_sync()
+                return
+            seq = self.store.seq(self.file)
+            if seq != self._holo_seq:
+                upd = self.store.updates(self.file, self._holo_seq)
+                if isinstance(upd, dict):  # truncated feed: re-derive all
+                    for tid in list(self._transcript_cache):
+                        if tid not in tids:
+                            self._invalidate_tid(tid)
+                    self._holo_needs_replace = True
+                    self._holo_sync()
+                    return
+                reg = {slot: tid for tid, slot in self.registry()}
+                extra = set()
+                for entry in upd:
+                    for c in entry.get("coords", []):
+                        ct = self._coord_tids(c, reg)
+                        if ct is None:  # registry / unknown: re-derive all
+                            for tid in list(self._transcript_cache):
+                                if tid not in tids:
+                                    self._invalidate_tid(tid)
+                            self._holo_needs_replace = True
+                            self._holo_sync()
+                            return
+                        extra |= ct
+                for tid in extra - set(tids):
+                    self._invalidate_tid(tid)
+                tids = set(tids) | extra
+            self._holo_in_sync = True
+            try:
+                fresh = {}
+                for tid in tids:
+                    fresh[tid] = {self._quad_line(q) for q in self._transcript_quads(tid)}
+                fresh["__global__"] = {self._quad_line(q) for q in self._global_quads()}
+            finally:
+                self._holo_in_sync = False
+            self._holo_post_diff(fresh)
+            self._holo_seq = seq
+        except Exception:
+            self._holo_needs_replace = True
+            raise
+
     def _holo_sync(self):
         """Keep the bridge's maintained quad set equal to this soul's
         projected quads: full replace on first use / truncation, else a
@@ -1167,7 +1320,6 @@ class Soul:
         _kind, seq, affected, _global_hit = got
         # Any change can move the global section (recent turns derive
         # from all transcripts), so it is re-derived on every diff.
-        keys = list(affected) + ["__global__"]
         self._holo_in_sync = True
         try:
             fresh = {}
@@ -1176,24 +1328,7 @@ class Soul:
             fresh["__global__"] = {self._quad_line(q) for q in self._global_quads()}
         finally:
             self._holo_in_sync = False
-        add, remove = [], []
-        for k in keys:
-            old = self._holo_sections.get(k, set())
-            new = fresh[k]
-            add += sorted(new - old)
-            remove += sorted(old - new)
-            self._holo_sections[k] = new
-        # A tid that vanished from the registry leaves stale lines.
-        for k in list(self._holo_sections):
-            if k != "__global__" and k not in {tid for tid, _s in self.registry()}:
-                remove += sorted(self._holo_sections.pop(k))
-        if add or remove:
-            payload = {}
-            if add:
-                payload["add"] = add
-            if remove:
-                payload["remove"] = remove
-            self.store.quads(self.file, payload)
+        self._holo_post_diff(fresh)
         self._holo_seq = seq
 
     def run_query(self, sparql, base=None):
