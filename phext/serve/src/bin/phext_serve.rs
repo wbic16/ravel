@@ -43,9 +43,9 @@ struct Soul {
     quad_set: HashSet<String>,
     /// The maintained quad set as an evaluator source, kept in step
     /// with `quads`/`quad_set` line by line (see the /quads handler).
-    /// VecSource is a plain Vec<Quad> with no precomputed indexes, so
-    /// push/remove per line are sound and /query borrows this directly
-    /// instead of re-parsing the joined lines per query.
+    /// VecSource maintains its position indexes on every push/remove,
+    /// so per-line maintenance stays sound and /query borrows this
+    /// directly instead of re-parsing the joined lines per query.
     source: VecSource,
     ring: VecDeque<RingEntry>,
 }

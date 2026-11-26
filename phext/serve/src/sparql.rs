@@ -239,21 +239,90 @@ pub trait QuadSource {
     fn graph_names(&self) -> Vec<String>;
     /// Every quad in one graph; `None` names the default graph.
     fn quads(&self, graph: Option<&str>) -> Vec<Quad>;
+    /// Every quad in one graph whose term at `pos` equals one of
+    /// `terms`, in the same order [`quads`](QuadSource::quads) would
+    /// yield them. The evaluator asks for these when a pattern position
+    /// is bound: a source with an index answers from the index, so a
+    /// point lookup stops costing a full scan of the graph. The
+    /// default implementation filters the full graph listing, so the
+    /// seam's contract is unchanged for sources without indexes.
+    fn quads_matching(&self, graph: Option<&str>, pos: Pos, terms: &[Term]) -> Vec<Quad> {
+        self.quads(graph)
+            .into_iter()
+            .filter(|q| terms.iter().any(|t| term_at(q, pos) == t))
+            .collect()
+    }
+}
+
+/// One position of a quad, for indexed candidate retrieval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pos {
+    Subject,
+    Predicate,
+    Object,
+}
+
+fn term_at(q: &Quad, pos: Pos) -> &Term {
+    match pos {
+        Pos::Subject => &q.s,
+        Pos::Predicate => &q.p,
+        Pos::Object => &q.o,
+    }
 }
 
 /// An in-memory [`QuadSource`]: the test fixture and the small-store
-/// implementation.
+/// implementation. The `Vec<Quad>` is the store of record; alongside
+/// it, three position indexes (term → quad positions, ascending) and
+/// a per-graph count are maintained on every mutation, so
+/// [`quads_matching`](QuadSource::quads_matching) answers a bound
+/// pattern position from the index instead of scanning the Vec.
+/// Appends extend the indexes in O(1); a removal rebuilds them (the
+/// removal itself is already a linear `retain`, so the rebuild does
+/// not change the write path's cost class).
 #[derive(Debug, Default, Clone)]
 pub struct VecSource {
     pub quads: Vec<Quad>,
+    by_subject: HashMap<Term, Vec<usize>>,
+    by_predicate: HashMap<Term, Vec<usize>>,
+    by_object: HashMap<Term, Vec<usize>>,
+    graph_counts: HashMap<Option<String>, usize>,
 }
 
 impl VecSource {
     pub fn new() -> Self {
-        VecSource { quads: Vec::new() }
+        VecSource::default()
     }
+
+    fn push_quad(&mut self, q: Quad) {
+        let pos = self.quads.len();
+        self.by_subject.entry(q.s.clone()).or_default().push(pos);
+        self.by_predicate.entry(q.p.clone()).or_default().push(pos);
+        self.by_object.entry(q.o.clone()).or_default().push(pos);
+        *self.graph_counts.entry(q.graph.clone()).or_default() += 1;
+        self.quads.push(q);
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.by_subject.clear();
+        self.by_predicate.clear();
+        self.by_object.clear();
+        self.graph_counts.clear();
+        let quads = std::mem::take(&mut self.quads);
+        for q in quads {
+            self.push_quad(q);
+        }
+    }
+
+    fn index_for(&self, pos: Pos) -> &HashMap<Term, Vec<usize>> {
+        match pos {
+            Pos::Subject => &self.by_subject,
+            Pos::Predicate => &self.by_predicate,
+            Pos::Object => &self.by_object,
+        }
+    }
+
     pub fn push(&mut self, graph: Option<&str>, s: Term, p: Term, o: Term) {
-        self.quads.push(Quad { graph: graph.map(str::to_string), s, p, o });
+        self.push_quad(Quad { graph: graph.map(str::to_string), s, p, o });
     }
     /// Read N-Quads / N-Triples text (a quad per line; triple terms and
     /// typed literals included). Errors name the line.
@@ -265,29 +334,32 @@ impl VecSource {
                 continue;
             }
             let q = parse_nt_line(line).map_err(|e| format!("line {}: {e}", i + 1))?;
-            src.quads.push(q);
+            src.push_quad(q);
         }
         Ok(src)
     }
     /// Parse and append ONE N-Triples / N-Quads line (the per-line seam
     /// of [`VecSource::from_nquads`]). Blank lines and comments are an
     /// error here — a caller feeding lines one at a time means each one
-    /// to count. The internal representation is a plain `Vec<Quad>`
-    /// with no precomputed indexes, so appending is always sound.
+    /// to count. Appending extends the position indexes in O(1).
     pub fn push_nt_line(&mut self, line: &str) -> Result<(), String> {
         let q = parse_nt_line(line.trim())?;
-        self.quads.push(q);
+        self.push_quad(q);
         Ok(())
     }
     /// Remove every quad equal to the one a single N-Triples / N-Quads
-    /// line parses to; returns whether anything was removed. Sound for
-    /// the same reason as [`VecSource::push_nt_line`]: no indexes to
-    /// keep in step, `quads()` filters the Vec on every call.
+    /// line parses to; returns whether anything was removed. The
+    /// position indexes are rebuilt afterwards (a removal is already a
+    /// linear retain over the Vec; the rebuild keeps them exact).
     pub fn remove_nt_line(&mut self, line: &str) -> Result<bool, String> {
         let q = parse_nt_line(line.trim())?;
         let before = self.quads.len();
         self.quads.retain(|x| x != &q);
-        Ok(self.quads.len() != before)
+        let removed = self.quads.len() != before;
+        if removed {
+            self.rebuild_indexes();
+        }
+        Ok(removed)
     }
 }
 
@@ -302,11 +374,9 @@ fn parse_nt_line(line: &str) -> Result<Quad, String> {
 impl QuadSource for VecSource {
     fn graph_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
-            .quads
-            .iter()
-            .filter_map(|q| q.graph.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
+            .graph_counts
+            .keys()
+            .filter_map(|g| g.clone())
             .collect();
         names.sort();
         names
@@ -314,6 +384,23 @@ impl QuadSource for VecSource {
     fn quads(&self, graph: Option<&str>) -> Vec<Quad> {
         self.quads
             .iter()
+            .filter(|q| q.graph.as_deref() == graph)
+            .cloned()
+            .collect()
+    }
+    fn quads_matching(&self, graph: Option<&str>, pos: Pos, terms: &[Term]) -> Vec<Quad> {
+        let index = self.index_for(pos);
+        let mut positions: Vec<usize> = Vec::new();
+        for t in terms {
+            if let Some(bucket) = index.get(t) {
+                positions.extend_from_slice(bucket);
+            }
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        positions
+            .into_iter()
+            .map(|i| &self.quads[i])
             .filter(|q| q.graph.as_deref() == graph)
             .cloned()
             .collect()
@@ -1804,12 +1891,15 @@ pub fn evaluate<S: QuadSource>(q: &Query, src: &S, prep: &Prep) -> Result<Outcom
             // Subject closure: every statement the source makes about
             // each resource, in any graph (the concise-description
             // shape; this stack's data has no blank nodes to chase).
+            // Fetched through the subject index: the closure IS the
+            // set of quads whose subject is a target.
             let mut seen = HashSet::new();
             let mut out = Vec::new();
             let mut graphs: Vec<Option<String>> = vec![None];
             graphs.extend(ev.ds.named.iter().map(|g| Some(g.clone())));
+            let target_terms: Vec<Term> = targets.iter().map(|t| Term::Iri(t.clone())).collect();
             for g in &graphs {
-                for quad in src.quads(g.as_deref()) {
+                for quad in src.quads_matching(g.as_deref(), Pos::Subject, &target_terms) {
                     if let Term::Iri(s) = &quad.s {
                         if targets.binary_search(s).is_ok() {
                             let t = Triple { s: quad.s.clone(), p: quad.p.clone(), o: quad.o.clone() };
@@ -1911,10 +2001,22 @@ fn collect_left(q: &Query, prep: &Prep, out: &mut Vec<String>) {
     }
 }
 
-/// The dataset a query runs against, resolved once.
+/// The dataset a query runs against, resolved once: which graphs a
+/// pattern outside GRAPH sees, and whether that view deduplicates
+/// triples across its graphs. The view holds graph NAMES, not
+/// triples — patterns fetch their own candidates per pattern (see
+/// [`Ev::pattern_candidates`]), so resolving a query no longer
+/// materializes (and re-hashes) the whole dataset per query. The
+/// resolution rules are the ones the materializing version encoded:
+/// no dataset clause → the union of the default graph and every
+/// named graph, deduplicated; FROM NAMED without FROM → the source's
+/// own default graph alone, un-deduplicated; otherwise the FROM
+/// graphs, deduplicated.
 struct DatasetView {
-    /// Triples visible to a pattern outside GRAPH (deduplicated set).
-    default_triples: Vec<Triple>,
+    /// Graphs visible to a pattern outside GRAPH, in view order.
+    default_graphs: Vec<Option<String>>,
+    /// Whether the default view deduplicates triples across graphs.
+    default_dedup: bool,
     /// Named graphs a GRAPH pattern may address.
     named: Vec<String>,
 }
@@ -1925,19 +2027,9 @@ impl DatasetView {
         match &q.dataset {
             None => {
                 // The union rule: default = own default ∪ every named.
-                let mut seen = HashSet::new();
-                let mut triples = Vec::new();
                 let mut graphs: Vec<Option<String>> = vec![None];
                 graphs.extend(all_named.iter().map(|g| Some(g.clone())));
-                for g in &graphs {
-                    for quad in src.quads(g.as_deref()) {
-                        let t = Triple { s: quad.s, p: quad.p, o: quad.o };
-                        if seen.insert(t.clone()) {
-                            triples.push(t);
-                        }
-                    }
-                }
-                DatasetView { default_triples: triples, named: all_named }
+                DatasetView { default_graphs: graphs, default_dedup: true, named: all_named }
             }
             Some(ds) => {
                 let named = if !ds.named.is_empty() {
@@ -1947,25 +2039,16 @@ impl DatasetView {
                 } else {
                     all_named.clone()
                 };
-                let default_triples = if ds.default.is_empty() && !ds.named.is_empty() {
-                    src.quads(None)
-                        .into_iter()
-                        .map(|quad| Triple { s: quad.s, p: quad.p, o: quad.o })
-                        .collect()
-                } else {
-                    let mut seen = HashSet::new();
-                    let mut triples = Vec::new();
-                    for g in &ds.default {
-                        for quad in src.quads(Some(g)) {
-                            let t = Triple { s: quad.s, p: quad.p, o: quad.o };
-                            if seen.insert(t.clone()) {
-                                triples.push(t);
-                            }
-                        }
-                    }
-                    triples
-                };
-                DatasetView { default_triples, named }
+                let (default_graphs, default_dedup) =
+                    if ds.default.is_empty() && !ds.named.is_empty() {
+                        (vec![None], false)
+                    } else {
+                        (
+                            ds.default.iter().map(|g| Some(g.clone())).collect(),
+                            true,
+                        )
+                    };
+                DatasetView { default_graphs, default_dedup, named }
             }
         }
     }
@@ -1985,16 +2068,101 @@ struct Ev<'a, S: QuadSource> {
 type EvalResult<T> = Result<T, EvalError>;
 
 impl<'a, S: QuadSource> Ev<'a, S> {
-    fn triples_in(&self, ctx: &Ctx) -> Vec<Triple> {
-        match ctx {
-            Ctx::Default => self.ds.default_triples.clone(),
-            Ctx::Named(g) => self
-                .src
-                .quads(Some(g))
-                .into_iter()
-                .map(|q| Triple { s: q.s, p: q.p, o: q.o })
-                .collect(),
+    /// The candidate triples one pattern can match, in view order.
+    /// When a pattern position is effectively bound (a constant, or a
+    /// variable the incoming solution already binds), candidates come
+    /// from the source's index for that position — subject first,
+    /// then predicate, then object — with the prep expansions folded
+    /// into the term set (predicate equivalence for a constant
+    /// predicate; the subclass closure for a constant `rdf:type`
+    /// object). The fetched set is always a superset of the pattern's
+    /// matches and `match_pattern` still verifies every candidate, so
+    /// indexing changes only the cost, never the results. Unbound
+    /// patterns fetch the whole view, as before. The default view's
+    /// cross-graph deduplication (see [`DatasetView`]) is applied to
+    /// the candidate list, exactly where the materializing version
+    /// applied it to the whole dataset.
+    fn pattern_candidates(&self, ctx: &Ctx, pat: &TriplePattern, sol: &Binding) -> Vec<Triple> {
+        let (graphs, dedup): (Vec<Option<String>>, bool) = match ctx {
+            Ctx::Default => (self.ds.default_graphs.clone(), self.ds.default_dedup),
+            Ctx::Named(g) => (vec![Some(g.clone())], false),
+        };
+        // (term, came-from-a-constant) for a pattern position.
+        let eff = |pt: &PatternTerm| -> Option<(Term, bool)> {
+            match pt {
+                PatternTerm::Term(t) => Some((t.clone(), true)),
+                PatternTerm::Var(v) => sol.get(v).map(|t| (t.clone(), false)),
+                PatternTerm::Triple(_) => None,
+            }
+        };
+        let es = eff(&pat.s);
+        let ep = eff(&pat.p);
+        let eo = eff(&pat.o);
+        let choice: Option<(Pos, Vec<Term>)> = if let Some((t, _)) = &es {
+            Some((Pos::Subject, vec![t.clone()]))
+        } else if let Some((t, konst)) = &ep {
+            let mut terms = vec![t.clone()];
+            if *konst {
+                if let Term::Iri(w) = t {
+                    if let Some(set) = self.prep.prop_equiv.get(w) {
+                        for x in set {
+                            let xt = Term::Iri(x.clone());
+                            if !terms.contains(&xt) {
+                                terms.push(xt);
+                            }
+                        }
+                    }
+                }
+            }
+            Some((Pos::Predicate, terms))
+        } else if let Some((t, konst)) = &eo {
+            let mut terms = vec![t.clone()];
+            if *konst {
+                if let Term::Iri(w) = t {
+                    // The subclass expansion applies only where the
+                    // stored predicate can be rdf:type: the pattern's
+                    // predicate is rdf:type, or it is not yet known
+                    // (a variable or triple term). Any other bound
+                    // predicate makes the object match exact.
+                    let type_possible = match &ep {
+                        None => true,
+                        Some((pt2, _)) => matches!(pt2, Term::Iri(i) if i == RDF_TYPE),
+                    };
+                    if type_possible {
+                        if let Some(set) = self.prep.class_subs.get(w) {
+                            for x in set {
+                                let xt = Term::Iri(x.clone());
+                                if !terms.contains(&xt) {
+                                    terms.push(xt);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some((Pos::Object, terms))
+        } else {
+            None
+        };
+        let mut out: Vec<Triple> = Vec::new();
+        let mut seen: HashSet<Triple> = HashSet::new();
+        for g in &graphs {
+            let quads = match &choice {
+                Some((pos, terms)) => self.src.quads_matching(g.as_deref(), *pos, terms),
+                None => self.src.quads(g.as_deref()),
+            };
+            for q in quads {
+                let t = Triple { s: q.s, p: q.p, o: q.o };
+                if dedup {
+                    if seen.insert(t.clone()) {
+                        out.push(t);
+                    }
+                } else {
+                    out.push(t);
+                }
+            }
         }
+        out
     }
 
     fn eval_group(&self, g: &Group, ctx: &Ctx, init: Binding) -> EvalResult<Vec<Binding>> {
@@ -2015,9 +2183,8 @@ impl<'a, S: QuadSource> Ev<'a, S> {
             let mut next = Vec::new();
             match el {
                 Element::Bgp(pats) => {
-                    let triples = self.triples_in(ctx);
                     for sol in sols {
-                        self.match_bgp(pats, &triples, &sol, &mut next);
+                        self.match_bgp(pats, ctx, &sol, &mut next);
                     }
                 }
                 Element::Graph(gt, inner) => {
@@ -2099,12 +2266,17 @@ impl<'a, S: QuadSource> Ev<'a, S> {
         Ok(sols)
     }
 
-    fn match_bgp(&self, pats: &[TriplePattern], triples: &[Triple], sol: &Binding, out: &mut Vec<Binding>) {
+    fn match_bgp(&self, pats: &[TriplePattern], ctx: &Ctx, sol: &Binding, out: &mut Vec<Binding>) {
         if pats.is_empty() {
             out.push(sol.clone());
             return;
         }
         let (pat, rest) = (&pats[0], &pats[1..]);
+        // Candidates for THIS pattern under the CURRENT solution:
+        // fetched per pattern (not once per BGP), so a variable the
+        // previous pattern bound becomes an index key for the next —
+        // joins get the same indexed treatment as point lookups.
+        let triples = self.pattern_candidates(ctx, pat, sol);
         // Fan-out deduplication (defect #104, V2-REPORT §5.3): calamus
         // fans one pattern out as { SELECT DISTINCT <pattern vars>
         // WHERE { VALUES … } }, so solutions from ONE triple pattern
@@ -2122,7 +2294,7 @@ impl<'a, S: QuadSource> Ev<'a, S> {
         // is exactly the DISTINCT the fan-out prescribes. Nothing is
         // deduplicated across patterns or joins.
         let mut first: Vec<Binding> = Vec::new();
-        for t in triples {
+        for t in &triples {
             if let Some(extended) = self.match_pattern(pat, t, sol) {
                 if !first.contains(&extended) {
                     first.push(extended);
@@ -2130,7 +2302,7 @@ impl<'a, S: QuadSource> Ev<'a, S> {
             }
         }
         for extended in first {
-            self.match_bgp(rest, triples, &extended, out);
+            self.match_bgp(rest, ctx, &extended, out);
         }
     }
 
@@ -3605,5 +3777,65 @@ mod tests {
             parse_instant("2026-01-01T01:00:00+01:00"),
             parse_instant("2026-01-01T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn quads_matching_agrees_with_full_listing() {
+        // The index must be a pure shortcut: for every position and a
+        // spread of term sets, quads_matching returns exactly the
+        // full-listing filter, in the same order, per graph.
+        let mut s = VecSource::new();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" .").unwrap();
+        s.push_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .").unwrap();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/q> <http://ex.org/b> .").unwrap();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" <http://ex.org/g> .").unwrap();
+        let terms = [
+            Term::iri("http://ex.org/a"),
+            Term::iri("http://ex.org/b"),
+            Term::iri("http://ex.org/p"),
+            Term::iri("http://ex.org/absent"),
+            Term::Literal(Literal::simple("1")),
+        ];
+        for pos in [Pos::Subject, Pos::Predicate, Pos::Object] {
+            for t in &terms {
+                for g in [None, Some("http://ex.org/g"), Some("http://ex.org/absent")] {
+                    let want: Vec<Quad> = s
+                        .quads(g)
+                        .into_iter()
+                        .filter(|q| term_at(q, pos) == t)
+                        .collect();
+                    assert_eq!(s.quads_matching(g, pos, std::slice::from_ref(t)), want, "{pos:?} {t:?} {g:?}");
+                }
+            }
+            // A multi-term set (the prep-expansion shape) also agrees.
+            let set = &terms[..3];
+            let want: Vec<Quad> = s
+                .quads(None)
+                .into_iter()
+                .filter(|q| set.contains(term_at(q, pos)))
+                .collect();
+            assert_eq!(s.quads_matching(None, pos, set), want, "{pos:?} multi");
+        }
+        assert_eq!(s.graph_names(), vec!["http://ex.org/g".to_string()]);
+    }
+
+    #[test]
+    fn indexes_stay_exact_across_remove() {
+        let mut s = VecSource::new();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" <http://ex.org/g> .").unwrap();
+        s.push_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .").unwrap();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" .").unwrap();
+        // Remove one of the two graphs' <a> statements; the rebuild
+        // must drop exactly it from every index and the graph census.
+        assert!(s.remove_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" <http://ex.org/g> .").unwrap());
+        assert_eq!(s.quads.len(), 2);
+        let a = Term::iri("http://ex.org/a");
+        assert_eq!(s.quads_matching(None, Pos::Subject, &[a.clone()]).len(), 1);
+        assert_eq!(s.quads_matching(Some("http://ex.org/g"), Pos::Subject, &[a]).len(), 0);
+        assert_eq!(s.graph_names(), vec!["http://ex.org/g".to_string()]);
+        // Removing the last quad of a graph removes the graph.
+        assert!(s.remove_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .").unwrap());
+        assert!(s.graph_names().is_empty());
+        assert!(!s.remove_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .").unwrap());
     }
 }
