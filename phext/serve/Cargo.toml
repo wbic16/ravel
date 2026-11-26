@@ -1,0 +1,28 @@
+[package]
+name = "phext-serve"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Ravel's serving machinery: a holo-phext store host (SQ-compatible REST + /txn + commit feed) with the SPARQL subset evaluator in-process. Relocated from phext-lattice in the 2026-11-26 de-slop; see ../DESLOP.md."
+repository = "https://github.com/wbic16/ravel"
+
+[dependencies]
+# libphext 0.6.6 from crates.io — must agree with holo-phext 0.2.5 on
+# ONE libphext so Coordinate is one type (same pin phext-lattice used).
+libphext = { version = "0.6.6", features = ["binary"] }
+# HoloPhext: phext-lattice's transaction layer; the store engine
+# phext-serve hosts. Same rev phext-lattice exo pins.
+holo-phext = { git = "https://github.com/wbic16/holo-phext", rev = "bafed5f36ebfad92f1011fe5c2bd8bdd3c3a9511" }
+# /txn and /quads speak JSON. In phext-lattice this arrived via the
+# web feature; here it is a direct dependency, named.
+serde_json = "1"
+# HoloPhext is async; the server runs on tokio (no web framework).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+
+[[bin]]
+name = "phext-serve"
+path = "src/bin/phext_serve.rs"
+
+[[bin]]
+name = "phext-sparql"
+path = "src/bin/phext_sparql.rs"

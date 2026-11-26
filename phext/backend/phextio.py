@@ -32,7 +32,14 @@ from contextlib import contextmanager
 from urllib.parse import quote
 
 SQ = os.path.expanduser("~/.cargo/bin/sq")
-HOLO_DEFAULT = "/home/wbic16/phext-lattice-vc/target/release/phext-serve"
+# phext-serve lives in this repo since the 2026-11-26 de-slop
+# (phext/serve/, relocated from phext-lattice): default to its build.
+HOLO_DEFAULT = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "serve", "target", "release", "phext-serve",
+    )
+)
 
 
 class SqError(RuntimeError):
