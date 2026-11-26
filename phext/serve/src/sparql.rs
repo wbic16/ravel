@@ -33,7 +33,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-pub const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 pub const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 pub const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 pub const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
@@ -243,15 +242,11 @@ pub trait QuadSource {
     /// `terms`, in the same order [`quads`](QuadSource::quads) would
     /// yield them. The evaluator asks for these when a pattern position
     /// is bound: a source with an index answers from the index, so a
-    /// point lookup stops costing a full scan of the graph. The
-    /// default implementation filters the full graph listing, so the
-    /// seam's contract is unchanged for sources without indexes.
-    fn quads_matching(&self, graph: Option<&str>, pos: Pos, terms: &[Term]) -> Vec<Quad> {
-        self.quads(graph)
-            .into_iter()
-            .filter(|q| terms.iter().any(|t| term_at(q, pos) == t))
-            .collect()
-    }
+    /// point lookup stops costing a full scan of the graph. Required:
+    /// the one implementation in the estate (VecSource) answers from
+    /// its position indexes, and a filtered-listing default would be
+    /// dead code beside it.
+    fn quads_matching(&self, graph: Option<&str>, pos: Pos, terms: &[Term]) -> Vec<Quad>;
 }
 
 /// One position of a quad, for indexed candidate retrieval.
@@ -260,14 +255,6 @@ pub enum Pos {
     Subject,
     Predicate,
     Object,
-}
-
-fn term_at(q: &Quad, pos: Pos) -> &Term {
-    match pos {
-        Pos::Subject => &q.s,
-        Pos::Predicate => &q.p,
-        Pos::Object => &q.o,
-    }
 }
 
 /// An in-memory [`QuadSource`]: the test fixture and the small-store
@@ -2093,6 +2080,20 @@ struct Ev<'a, S: QuadSource> {
 
 type EvalResult<T> = Result<T, EvalError>;
 
+/// Fold a prep expansion set into a candidate term set: every stored
+/// spelling the asked name maps to, as an Iri term, appended if not
+/// already present (the asked term itself leads).
+fn expand_terms(terms: &mut Vec<Term>, set: Option<&Vec<String>>) {
+    if let Some(set) = set {
+        for x in set {
+            let xt = Term::Iri(x.clone());
+            if !terms.contains(&xt) {
+                terms.push(xt);
+            }
+        }
+    }
+}
+
 impl<'a, S: QuadSource> Ev<'a, S> {
     /// The candidate triples one pattern can match, in view order.
     /// When a pattern position is effectively bound (a constant, or a
@@ -2130,14 +2131,7 @@ impl<'a, S: QuadSource> Ev<'a, S> {
             let mut terms = vec![t.clone()];
             if *konst {
                 if let Term::Iri(w) = t {
-                    if let Some(set) = self.prep.prop_equiv.get(w) {
-                        for x in set {
-                            let xt = Term::Iri(x.clone());
-                            if !terms.contains(&xt) {
-                                terms.push(xt);
-                            }
-                        }
-                    }
+                    expand_terms(&mut terms, self.prep.prop_equiv.get(w));
                 }
             }
             Some((Pos::Predicate, terms))
@@ -2155,14 +2149,7 @@ impl<'a, S: QuadSource> Ev<'a, S> {
                         Some((pt2, _)) => matches!(pt2, Term::Iri(i) if i == RDF_TYPE),
                     };
                     if type_possible {
-                        if let Some(set) = self.prep.class_subs.get(w) {
-                            for x in set {
-                                let xt = Term::Iri(x.clone());
-                                if !terms.contains(&xt) {
-                                    terms.push(xt);
-                                }
-                            }
-                        }
+                        expand_terms(&mut terms, self.prep.class_subs.get(w));
                     }
                 }
             }
@@ -2767,7 +2754,7 @@ pub fn ebv(t: &Term) -> bool {
     match t {
         Term::Literal(l) => match l.datatype.as_deref() {
             Some(XSD_BOOLEAN) => l.value == "true" || l.value == "1",
-            Some(dt) if l.is_numeric() => l.value.parse::<f64>().map(|n| n != 0.0).unwrap_or(false),
+            Some(_) if l.is_numeric() => l.value.parse::<f64>().map(|n| n != 0.0).unwrap_or(false),
             _ => !l.value.is_empty(),
         },
         _ => true,
@@ -2955,7 +2942,7 @@ impl ReParser {
                         self.at += 1;
                     }
                     let mut max = None;
-                    let mut ok = !min.is_empty();
+                    let ok = !min.is_empty();
                     if self.peek() == Some(',') {
                         self.at += 1;
                         let mut m = String::new();
@@ -3229,6 +3216,15 @@ mod tests {
 
     fn iri(s: &str) -> Term {
         Term::Iri(s.to_string())
+    }
+    /// The term at a position of a quad — the full-listing filter the
+    /// agreement tests check `quads_matching` against.
+    fn term_at(q: &Quad, pos: Pos) -> &Term {
+        match pos {
+            Pos::Subject => &q.s,
+            Pos::Predicate => &q.p,
+            Pos::Object => &q.o,
+        }
     }
     fn lit(s: &str) -> Term {
         Term::Literal(Literal::simple(s))

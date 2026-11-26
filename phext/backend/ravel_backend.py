@@ -176,14 +176,6 @@ class Names:
         self.root = root
         self.user = user
 
-    @classmethod
-    def from_repo_yml(cls, text):
-        squad = re.search(r"(?m)^\s*squad:\s*(\S+)\s*$", text)
-        user = re.search(r"(?m)^\s*username:\s*(\S+)\s*$", text)
-        if squad and user:
-            return cls(f"https://repolex.ai/{squad.group(1)}/{user.group(1)}/", user.group(1))
-        return cls("https://repolex.ai/", user.group(1) if user else "")
-
     def turn(self, event_id):
         return f"{self.root}ravel/Turn/{event_id}"
 

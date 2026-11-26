@@ -50,8 +50,15 @@ def _stem(name):
     return name[:-6] if name.endswith(".phext") else name
 
 
-class PhextStore:
-    """A directory of soul phexts behind one SQ host process."""
+class _StoreBase:
+    """The transport surface the two stores share: one host process
+    per data directory, serving every soul phext over /api/v2 by stem
+    name. Subclasses differ only in the process they launch, their
+    request timeout/label, and their write path (immediate vs the
+    holo batch/txn machinery)."""
+
+    _timeout = 30
+    _label = "SQ"
 
     def __init__(self, data_dir, port):
         self.dir = data_dir
@@ -60,16 +67,10 @@ class PhextStore:
         self.proc = None
 
     # -- lifecycle ------------------------------------------------------
-    def start(self):
+    def _launch(self, argv, label):
         os.makedirs(self.dir, exist_ok=True)
-        # A stale .sq/ state dir can wedge a fresh host; this dir is ours.
-        stale = os.path.join(self.dir, ".sq")
-        if os.path.isdir(stale):
-            import shutil
-
-            shutil.rmtree(stale)
         self.proc = subprocess.Popen(
-            [SQ, "host", str(self.port)],
+            argv,
             cwd=self.dir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -81,7 +82,7 @@ class PhextStore:
                 return
             except Exception:
                 time.sleep(0.25)
-        raise SqError(f"SQ host on port {self.port} did not come up")
+        raise SqError(f"{label} on port {self.port} did not come up")
 
     def stop(self):
         if self.proc is not None:
@@ -101,17 +102,21 @@ class PhextStore:
                 fh.write(b"\x01")
 
     # -- raw HTTP ---------------------------------------------------------
-    def _raw(self, method, suffix, body=None):
+    def _raw(self, method, suffix, body=None, headers=None):
+        return self._raw_full(method, suffix, body=body, headers=headers)[1]
+
+    def _raw_full(self, method, suffix, body=None, headers=None):
         req = urllib.request.Request(
             self.base + suffix,
             method=method,
-            data=body.encode("utf-8") if body is not None else None,
+            data=body.encode("utf-8") if isinstance(body, str) else body,
+            headers=headers or {},
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.read().decode("utf-8")
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                return {k.lower(): v for k, v in resp.headers.items()}, resp.read().decode("utf-8")
         except urllib.error.URLError as e:
-            raise SqError(f"SQ {method} {suffix}: {e}") from e
+            raise SqError(f"{self._label} {method} {suffix}: {e}") from e
 
     # -- scroll operations --------------------------------------------------
     def read(self, name, coord):
@@ -119,9 +124,6 @@ class PhextStore:
 
     def exists(self, name, coord):
         return coord in self.toc(name)
-
-    def write(self, name, coord, text):
-        self._raw("POST", f"/update?c={coord}&p={_stem(name)}", text)
 
     def toc(self, name):
         """coord -> title for every non-empty scroll in the phext."""
@@ -137,10 +139,27 @@ class PhextStore:
         return sorted(c for c in self.toc(name) if c.startswith(prefix))
 
     def clear_region(self, name, prefix):
-        """Empty every scroll under a coordinate prefix (SQ has no
-        delete; an emptied scroll leaves the toc, which is the region)."""
+        """Empty every scroll under a coordinate prefix (neither host
+        has a delete; an emptied scroll leaves the toc, which is the
+        region)."""
         for coord in self.coords_with_prefix(name, prefix):
             self.write(name, coord, "")
+
+
+class PhextStore(_StoreBase):
+    """A directory of soul phexts behind one SQ host process."""
+
+    def start(self):
+        # A stale .sq/ state dir can wedge a fresh host; this dir is ours.
+        stale = os.path.join(self.dir, ".sq")
+        if os.path.isdir(stale):
+            import shutil
+
+            shutil.rmtree(stale)
+        self._launch([SQ, "host", str(self.port)], "SQ host")
+
+    def write(self, name, coord, text):
+        self._raw("POST", f"/update?c={coord}&p={_stem(name)}", text)
 
     @contextmanager
     def batch(self, name):
@@ -149,7 +168,7 @@ class PhextStore:
         yield self
 
 
-class HoloStore:
+class HoloStore(_StoreBase):
     """Same public interface as PhextStore, against phext-serve.
 
     phext-serve is SQ-compatible on select/update/insert/toc and adds
@@ -157,94 +176,24 @@ class HoloStore:
     (maintained in-memory quad set) and /query (in-process SPARQL).
     On disk a soul is `<stem>.phext` + `<stem>.wal.phext` (WAL)."""
 
+    _timeout = 120
+    _label = "holo"
+
     def __init__(self, data_dir, port):
-        self.dir = data_dir
-        self.port = port
-        self.base = f"http://127.0.0.1:{port}/api/v2"
-        self.proc = None
+        super().__init__(data_dir, port)
         self.bin = os.environ.get("RAVEL_HOLO_BIN", HOLO_DEFAULT)
         self._batch_depth = 0
-        self._batch_name = None
         self._batch_writes = {}  # (name, coord) -> text, insertion-ordered
 
     # -- lifecycle ------------------------------------------------------
     def start(self):
-        os.makedirs(self.dir, exist_ok=True)
-        self.proc = subprocess.Popen(
-            [self.bin, str(self.port)],
-            cwd=self.dir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            try:
-                self._raw("GET", "/toc?p=__ping__")
-                return
-            except Exception:
-                time.sleep(0.25)
-        raise SqError(f"phext-serve on port {self.port} did not come up")
-
-    def stop(self):
-        if self.proc is not None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-            self.proc = None
-
-    def ensure_file(self, name):
-        path = os.path.join(self.dir, name)
-        if not os.path.exists(path):
-            with open(path, "wb") as fh:
-                fh.write(b"\x01")
-
-    # -- raw HTTP ---------------------------------------------------------
-    def _raw(self, method, suffix, body=None, headers=None):
-        return self._raw_full(method, suffix, body=body, headers=headers)[1]
-
-    def _raw_full(self, method, suffix, body=None, headers=None):
-        req = urllib.request.Request(
-            self.base + suffix,
-            method=method,
-            data=body.encode("utf-8") if isinstance(body, str) else body,
-            headers=headers or {},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                return {k.lower(): v for k, v in resp.headers.items()}, resp.read().decode("utf-8")
-        except urllib.error.URLError as e:
-            raise SqError(f"holo {method} {suffix}: {e}") from e
-
-    # -- scroll operations --------------------------------------------------
-    def read(self, name, coord):
-        return self._raw("GET", f"/select?c={coord}&p={_stem(name)}")
-
-    def exists(self, name, coord):
-        return coord in self.toc(name)
+        self._launch([self.bin, str(self.port)], "phext-serve")
 
     def write(self, name, coord, text):
         if self._batch_depth:
             self._batch_writes[(name, coord)] = text
             return
         self._raw("POST", f"/update?c={coord}&p={_stem(name)}", text)
-
-    def toc(self, name):
-        out = {}
-        for line in self._raw("GET", f"/toc?p={_stem(name)}").splitlines():
-            line = line.strip()
-            if line.startswith("*") and ":" in line:
-                coord, title = line[1:].split(":", 1)
-                out[coord.strip()] = title.strip()
-        return out
-
-    def coords_with_prefix(self, name, prefix):
-        return sorted(c for c in self.toc(name) if c.startswith(prefix))
-
-    def clear_region(self, name, prefix):
-        for coord in self.coords_with_prefix(name, prefix):
-            self.write(name, coord, "")
 
     # -- holo-only primitives ---------------------------------------------
     def txn(self, name, writes):
@@ -280,7 +229,6 @@ class HoloStore:
         discarded (the txn never happens)."""
         outermost = self._batch_depth == 0
         if outermost:
-            self._batch_name = name
             self._batch_writes = {}
         self._batch_depth += 1
         try:

@@ -234,3 +234,131 @@ heat-soaked from the preceding legs). The suite legs then ran
 under the vc-runner discipline (start below the line, SIGSTOP
 on three sustained >88 °C samples, resume <82 °C) and completed
 with no pause triggered.
+
+## The minimization pass — same behavior, less estate
+
+Executed 2026-11-26 on aletheia-core under Will's direction
+"continue minimizing ravel while preserving behavior"
+(2026-11-26 07:57 CST). Method: baseline first (census, suites,
+scale driver, probe, and the dedup pass's 12-query differential
+battery, all on the unmodified tree), then reductions in the
+order duplication → proven-dead → collapsed seams, with the full
+gate re-run on the final tree. Anything a gate caught would have
+come back out; nothing caught.
+
+### What came out, by evidence class
+
+**Duplication (transport factoring).** `phext/backend/phextio.py`:
+PhextStore (SQ) and HoloStore carried the same lifecycle,
+raw-HTTP, and scroll-operation surface twice. Both now extend
+`_StoreBase`, which holds that surface once; each subclass keeps
+only its own process launch, its timeout/label (SQ 30 s / "SQ",
+holo 120 s / "holo" — the error strings are unchanged), and its
+write path (SQ immediate; holo batch/txn + /seq /updates /quads
+/query). phextio.py 304 → 252.
+
+**Proven dead** (grep across the estate + entry points before
+removal):
+
+- `Names.from_repo_yml` (ravel_backend.py, −8): no caller
+  anywhere in the estate; every `Names(` construction (backend,
+  harness, wavelets, v2 instruments) uses the plain constructor,
+  and no code in the tree reads a repo.yml.
+- `pub const XSD` (sparql.rs, −1): the only occurrence in the
+  estate was its definition (the datatype consts are used; the
+  bare namespace const was not).
+- `HoloStore._batch_name` (phextio.py): write-only state —
+  assigned in `__init__` and `batch()`, read nowhere; removed
+  inside the factoring.
+- `fn term_at` (sparql.rs): its only production caller was the
+  trait default removed below; its remaining users are the
+  `quads_matching` agreement tests, so it moved into the test
+  module (−9 production, +9 tests).
+
+**Collapsed seams (evaluator).**
+
+- `QuadSource::quads_matching` lost its default body and is now
+  a required method (−6 net with its doc): VecSource is the only
+  QuadSource implementation in the estate and it overrides the
+  method from its indexes, so the filtered-listing default had
+  no execution path. The agreement test still pins the override
+  against the full-listing filter — the contract the default
+  used to state is now stated by the test.
+- The two prep-expansion loops in `pattern_candidates`
+  (predicate equivalence, subclass closure) were the same fold
+  twice; they now share `expand_terms` (−5 net).
+- `DatasetView` was audited and left: the indexing pass already
+  collapsed it to graph names + a dedup flag; nothing redundant
+  remains in it.
+- Compiler warnings 2 → 0 (`ebv`'s unused datatype binding; the
+  regex parser's unneeded `mut`).
+
+**Kept, with the reason on record.** phext-serve's `/insert`
+endpoint: no backend caller, but the serve smoke exercises it
+and its seq accounting depends on it — not dead by the estate's
+own instruments. The SQ transport and the `RAVEL_TRANSPORT`
+default: untouched (see the decision block below).
+
+### Before / after (same census script, same basis)
+
+| Area | Before | After |
+|---|---:|---:|
+| backend Python (4 files) | 2,306 | 2,246 |
+| serve Rust production (sparql prod + lib + 2 bins) | 4,005 | 3,992 |
+| serve Rust tests | 711 | 720 |
+| LOC_prod (backend + serve production) | 6,311 | 6,238 |
+| C, ROI basis (LOC/100 + 30 + 250 + 100) | 443.11 | 442.38 |
+| C, full-stack (ROI basis + serve lock 29) | 472.11 | 471.38 |
+
+The delta is honestly small, and the record should say why: the
+two optimization passes had already removed the estate's fat (a
+per-query dataset clone in the evaluator; a quadratic dedup).
+What remained was duplication and residue, and C is dominated
+by terms this pass does not touch (formats 250, languages 100,
+packages 59 of the 442). The structural win is that the
+transport surface now exists once — the next change to it lands
+in one place — and the build is warning-free.
+
+### The gate, on the final tree (all of it)
+
+- Harness 72/72 holo, 72/72 SQ; Wavelets 19/19 both transports.
+- Differential battery: 12/12 digests byte-identical to the
+  baseline digests (in-process timings in family: count 42.3 →
+  41.1–45.5 ms across runs, point 0.0020 → 0.0019 ms).
+- Scale driver: point cold/warm unchanged on all three souls
+  (0.003/0.001); ingest and mutation within the day's
+  shared-node noise; store bytes byte-identical (incipit
+  9,503,899; tasks 31,752,817; state 17,338,049).
+- Probe: full-path point 0.36 → 0.351 ms; full-scan count
+  50.3 → 47.7 ms.
+- Serve smokes 30/30 + checkpoint 15/15; serve crate tests
+  30/30; `cargo build --release` warning-free.
+- Thermals: every leg ≤ 63 °C; the 88 °C line was never
+  approached.
+
+### Flagged, not done — the SQ path is a separate decision
+
+What remains attributable to the SQ transport, measured on the
+final tree:
+
+- phextio.py `PhextStore`: 20 lines. ravel_backend.py SQ-only
+  code: ~32 lines (the `EVALUATOR` constant block,
+  `_evaluator_inputs`, and `run_query`'s subprocess branch).
+  The serve crate's `phext_sparql.rs` bin: 104 lines (exists
+  only to serve the SQ path's subprocess protocol; holo's
+  /query returns identical bytes in-process). In-tree total
+  ≈ 156 production lines.
+- Outside the tree: the SQ host process itself (a second
+  persistent process per data directory beside phext-serve)
+  and its 30 unique locked packages, which are 30 of C's
+  points. Dropping SQ would take C (ROI basis) from 442.38 to
+  ≈ 410.8.
+- What dropping it would change operationally:
+  `RAVEL_TRANSPORT`'s default flips to holo (SQ is the current
+  default and the regression baseline); the harness loses its
+  second-transport leg — the cross-check that historically
+  caught the v2 errata; verify/v2's instruments (scale.py,
+  compare.py, probe.py — 344 lines) construct `PhextStore`
+  directly and would need porting to HoloStore or retirement,
+  and with them goes the v2 measurement chain's comparability.
+  Not attempted here, per this pass's scope.
