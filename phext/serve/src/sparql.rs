@@ -1817,6 +1817,32 @@ pub enum Results {
 /// One solution row: variable → term (absent = unbound).
 pub type Binding = HashMap<String, Term>;
 
+/// Canonical hashable key for a [`Binding`].
+///
+/// A `Binding` is a `HashMap`: it has equality (same variables bound
+/// to the same terms, regardless of insertion order) but no `Hash`,
+/// because there is no order-independent way to hash the map itself.
+/// The canonical key is the binding's entry list as `(variable,
+/// term)` pairs sorted ascending by variable name (byte order).
+/// Sorting makes the key a pure function of the binding's contents:
+/// two bindings have equal keys iff they are equal as maps — the
+/// pair list is compared element-wise, so key equality is exact,
+/// not a digest. The definition is total over partial bindings: a
+/// binding that binds only some of a query's variables keys on
+/// exactly the entries it has, and an unbound variable is simply
+/// absent — which is also how `Binding` equality sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BindingKey(Vec<(String, Term)>);
+
+impl BindingKey {
+    pub fn canonical(b: &Binding) -> Self {
+        let mut entries: Vec<(String, Term)> =
+            b.iter().map(|(v, t)| (v.clone(), t.clone())).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        BindingKey(entries)
+    }
+}
+
 #[derive(Debug)]
 pub struct Outcome {
     pub results: Results,
@@ -2293,10 +2319,22 @@ impl<'a, S: QuadSource> Ev<'a, S> {
         // only multiplicity, never the set of distinct results, which
         // is exactly the DISTINCT the fan-out prescribes. Nothing is
         // deduplicated across patterns or joins.
+        //
+        // Membership is hash-priced: `first` keeps the extensions in
+        // first-occurrence order (the recursion below consumes them
+        // in that order, so order is preserved exactly), while
+        // `seen` — canonical keys, see [`BindingKey`] — answers the
+        // membership question in O(1) per extension. Key equality is
+        // exactly `Binding` equality, so the extensions kept, and
+        // their order, are unchanged; the dedup is linear in the
+        // number of extensions where a `Vec::contains` membership
+        // test made it quadratic (the pre-fix full-scan floor:
+        // ~4 s for `GRAPH ?g { ?s ?p ?o }` over the state soul).
         let mut first: Vec<Binding> = Vec::new();
+        let mut seen: HashSet<BindingKey> = HashSet::new();
         for t in &triples {
             if let Some(extended) = self.match_pattern(pat, t, sol) {
-                if !first.contains(&extended) {
+                if seen.insert(BindingKey::canonical(&extended)) {
                     first.push(extended);
                 }
             }
@@ -3350,6 +3388,59 @@ mod tests {
         assert_eq!(rows(&s, &q).len(), 2);
         let q = format!("{P} SELECT ?g ?s WHERE {{ GRAPH ?g {{ ?s a subtexture:Thing }} }}");
         assert_eq!(rows(&s, &q).len(), 2);
+    }
+
+    #[test]
+    fn binding_key_equality_is_binding_equality() {
+        // Same contents, different insertion order → same key, and
+        // set membership agrees (hash consistency with equality).
+        let mut a = Binding::new();
+        a.insert("s".to_string(), iri("http://ex.org/a"));
+        a.insert("p".to_string(), iri("http://ex.org/b"));
+        let mut b = Binding::new();
+        b.insert("p".to_string(), iri("http://ex.org/b"));
+        b.insert("s".to_string(), iri("http://ex.org/a"));
+        assert_eq!(a, b);
+        assert_eq!(BindingKey::canonical(&a), BindingKey::canonical(&b));
+        let mut set = HashSet::new();
+        assert!(set.insert(BindingKey::canonical(&a)));
+        assert!(!set.insert(BindingKey::canonical(&b)));
+        // A partial binding (subset of the variables) is a
+        // different key — unbound is absent, not a wildcard.
+        let mut c = Binding::new();
+        c.insert("s".to_string(), iri("http://ex.org/a"));
+        assert_ne!(BindingKey::canonical(&a), BindingKey::canonical(&c));
+        // Same variables, one different term → different key.
+        let mut d = Binding::new();
+        d.insert("s".to_string(), iri("http://ex.org/a"));
+        d.insert("p".to_string(), iri("http://ex.org/z"));
+        assert_ne!(BindingKey::canonical(&a), BindingKey::canonical(&d));
+        // The empty binding keys fine.
+        assert_eq!(
+            BindingKey::canonical(&Binding::new()),
+            BindingKey::canonical(&Binding::new())
+        );
+    }
+
+    #[test]
+    fn fanout_dedup_keeps_exactly_the_distinct_extensions_at_scale() {
+        // 400 subjects, each typed BOTH stored spellings of the
+        // asked class: 800 candidate extensions through one pattern,
+        // exactly 400 distinct. The hash-priced dedup must keep all
+        // 400, once each — the same discipline the small fan-out
+        // tests pin, at a size where the membership cost is the
+        // point of the exercise.
+        let mut s = VecSource::new();
+        let g = Some("https://repolex.ai/ravel/NamedGraph/craft");
+        for i in 0..400 {
+            let z = iri(&format!("https://repolex.ai/ravel/Turn/z{i}"));
+            s.push(g, z.clone(), iri(RDF_TYPE), iri(&format!("{R}Turn")));
+            s.push(g, z, iri(RDF_TYPE), iri(&format!("{R}Memory")));
+        }
+        let q = format!("{P} SELECT ?s WHERE {{ ?s a subtexture:Thing }}");
+        assert_eq!(rows(&s, &q).len(), 400);
+        let q = format!("{P} SELECT ?g ?s WHERE {{ GRAPH ?g {{ ?s a subtexture:Thing }} }}");
+        assert_eq!(rows(&s, &q).len(), 400);
     }
 
     #[test]
