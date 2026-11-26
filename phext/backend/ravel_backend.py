@@ -28,7 +28,12 @@ XSD = "http://www.w3.org/2001/XMLSchema#"
 ABSTRACT = "https://repolex.ai/ontology/subtexture/"
 EVALUATOR = os.environ.get(
     "PHEXT_SPARQL_BIN",
-    os.path.expanduser("~/phext-lattice-ravel/target/debug/phext-sparql"),
+    os.path.normpath(
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "serve", "target", "debug", "phext-sparql",
+        )
+    ),
 )
 ONTOLOGY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ontology")
 
