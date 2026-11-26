@@ -22,10 +22,10 @@ def timed(fn, n=5):
 
 def main():
     import ravel_backend as rb
-    from phextio import PhextStore
+    from phextio import make_store
 
     data = os.environ["MEASURE_DATA"]
-    store = PhextStore(data, int(os.environ["MEASURE_SQ"]))
+    store = make_store(data, int(os.environ["MEASURE_SQ"]))
     store.start()
     try:
         soul = rb.Soul(store, "soul-a", rb.Names(ROOT_A, "spacegoat"), None).open()

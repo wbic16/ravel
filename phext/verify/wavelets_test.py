@@ -52,7 +52,7 @@ os.environ.setdefault(
 
 import optmem  # noqa: E402
 import ravel_backend as rb  # noqa: E402
-from phextio import PhextStore  # noqa: E402
+from phextio import make_store  # noqa: E402
 
 RAVEL = rb.RAVEL
 ROOT = "https://repolex.ai/era/"
@@ -363,7 +363,7 @@ def setUpModule():
     if os.path.isdir(DATA):
         shutil.rmtree(DATA)
     os.makedirs(DATA)
-    STORE = PhextStore(DATA, PORT)
+    STORE = make_store(DATA, PORT)
     STORE.start()
     names = rb.Names(ROOT, "emise")
     SOUL = rb.Soul(STORE, SOUL_ID, names, machine_owner="will").open()

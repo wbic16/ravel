@@ -599,6 +599,19 @@ class Soul:
         self._coord_turn = {}  # identity scroll coordinate -> event_id
         self._dirty = True
         self._inputs = None  # cached (nquads, prep) for the evaluator
+        self._transcript_cache = {}  # tid -> (events, annotations)
+        # holo bridge state (unused in SQ mode)
+        self._holo_synced = False
+        self._holo_seq = 0
+        self._holo_sections = None  # section key -> set of NT lines
+        self._holo_needs_replace = False
+
+    @property
+    def _is_holo(self):
+        return hasattr(self.store, "quads") and hasattr(self.store, "query")
+
+    def _invalidate_tid(self, tid):
+        self._transcript_cache.pop(tid, None)
 
     # -- open ------------------------------------------------------------
     def open(self):
@@ -657,6 +670,10 @@ class Soul:
 
     # -- the store seam: ingest / append ----------------------------------
     def ingest_transcript(self, tid, events, annotations, append=False):
+        with self.store.batch(self.file):
+            return self._ingest_transcript_impl(tid, events, annotations, append=append)
+
+    def _ingest_transcript_impl(self, tid, events, annotations, append=False):
         slot = self._slot_of(tid, create=True)
         vol = slot + 2
         if append:
@@ -684,6 +701,7 @@ class Soul:
                 quads += len(annotation_quads(self.names, f"{self.names.root}ravel/", self.names.graph(tid), tid, a))
         for sec, val in ((1, len(events)), (2, len(annotations)), (3, quads)):
             self.store.write(self.file, coord(3, vol, 1, 1, sec, 1), str(val))
+        self._invalidate_tid(tid)
         self._dirty = True
         return {"turns": len(events), "annotations": len(annotations), "quads": quads}
 
@@ -722,6 +740,8 @@ class Soul:
 
     # -- reading the store back ---------------------------------------------
     def read_transcript(self, tid):
+        if tid in self._transcript_cache:
+            return self._transcript_cache[tid]
         slot = self._slot_of(tid)
         if slot is None:
             return [], []
@@ -733,6 +753,7 @@ class Soul:
                 continue
             events.append(ev)
             annotations.extend(self._read_annotations(vol, book))
+        self._transcript_cache[tid] = (events, annotations)
         return events, annotations
 
     def _read_event(self, vol, book):
@@ -816,6 +837,10 @@ class Soul:
         return out
 
     def append_note(self, note):
+        with self.store.batch(self.file):
+            return self._append_note_impl(note)
+
+    def _append_note_impl(self, note):
         book = len(self._books(1, lib=2)) + 1
         W = self.store.write
         for sec, val in ((1, note["id"]), (2, note["ts"]), (3, note["text"]), (4, note["model"])):
@@ -841,6 +866,10 @@ class Soul:
         return out
 
     def upsert_summary(self, s):
+        with self.store.batch(self.file):
+            return self._upsert_summary_impl(s)
+
+    def _upsert_summary_impl(self, s):
         span = optmem.parse_block(s["block"])
         if span is None:
             raise ValueError(f"bad block id {s['block']!r}")
@@ -855,35 +884,49 @@ class Soul:
         return optmem.built_blocks(self.summaries(), len(self.notes()))
 
     # -- the QuadSource glue ---------------------------------------------------
-    def all_quads(self):
+    def _desc_quads(self, quads, gname, cls):
+        g = iri(self.names.graph(gname))
+        quads.append((None, g, iri(RDF_TYPE), iri(RAVEL + cls)))
+        quads.append((None, g, iri(RAVEL + "visibility"), lit("private")))
+        if self.names.owner:
+            quads.append((None, g, iri(RAVEL + "owner"), iri(self.names.owner)))
+
+    def _transcript_quads(self, tid):
         quads = []
-
-        def desc(gname, cls):
-            g = iri(self.names.graph(gname))
-            quads.append((None, g, iri(RDF_TYPE), iri(RAVEL + cls)))
-            quads.append((None, g, iri(RAVEL + "visibility"), lit("private")))
-            if self.names.owner:
-                quads.append((None, g, iri(RAVEL + "owner"), iri(self.names.owner)))
-
+        self._desc_quads(quads, tid, "TranscriptGraph")
+        events, annotations = self.read_transcript(tid)
+        gname = self.names.graph(tid)
         base = f"{self.names.root}ravel/"
-        for tid, _slot in self.registry():
-            desc(tid, "TranscriptGraph")
-            events, annotations = self.read_transcript(tid)
-            gname = self.names.graph(tid)
-            for ev in events:
-                quads += spine_quads(self.names, gname, ev, self.machine_owner)
-            for a in annotations:
-                quads += annotation_quads(self.names, base, gname, tid, a)
+        for ev in events:
+            quads += spine_quads(self.names, gname, ev, self.machine_owner)
+        for a in annotations:
+            quads += annotation_quads(self.names, base, gname, tid, a)
+        return quads
+
+    def _global_quads(self):
+        """Notes/memory + recent-turns quads: the non-transcript section.
+        Depends on every transcript (recent), so any transcript change
+        re-derives it in holo mode."""
+        quads = []
         notes = self.notes()
         if notes:
-            desc("optmem", "MemoryGraph")
+            self._desc_quads(quads, "optmem", "MemoryGraph")
             quads += self._memory_quads(notes)
         recent = self.recent_turns()
         if recent:
-            desc("recent", "NamedGraph")
+            self._desc_quads(quads, "recent", "NamedGraph")
             rg = self.names.graph("recent")
             for t in recent:
                 quads.append((rg, iri(rg), iri(RDFS_MEMBER), iri(t)))
+        return quads
+
+    def all_quads(self):
+        if self._is_holo and self._holo_synced and not getattr(self, "_holo_in_sync", False):
+            self._holo_poll_cache()
+        quads = []
+        for tid, _slot in self.registry():
+            quads += self._transcript_quads(tid)
+        quads += self._global_quads()
         return quads
 
     def _memory_quads(self, notes):
@@ -955,15 +998,15 @@ class Soul:
         return [t for t, _w in ordered[:limit]]
 
     # -- the evaluator ----------------------------------------------------------
-    def _evaluator_inputs(self):
-        if not self._dirty and self._inputs is not None:
-            return self._inputs
-        lines = []
-        for g, s, p, o in self.all_quads():
-            line = f"{nt(s)} {nt(p)} {nt(o)}"
-            if g is not None:
-                line += f" <{g}>"
-            lines.append(line + " .")
+    @staticmethod
+    def _quad_line(q):
+        g, s, po, o = q
+        line = f"{nt(s)} {nt(po)} {nt(o)}"
+        if g is not None:
+            line += f" <{g}>"
+        return line + " ."
+
+    def _prep_text(self):
         prop_equiv, class_subs = ontology_prep()
         prep = []
         for asked, stored in prop_equiv.items():
@@ -973,27 +1016,25 @@ class Soul:
             for st in stored:
                 prep.append(f"subclass\t{asked}\t{st}")
         prep.append(f"abstract\t{ABSTRACT}")
-        self._inputs = ("\n".join(lines) + "\n", "\n".join(prep) + "\n")
+        return "\n".join(prep) + "\n"
+
+    def _evaluator_inputs(self):
+        if not self._dirty and self._inputs is not None:
+            return self._inputs
+        lines = [self._quad_line(q) for q in self.all_quads()]
+        self._inputs = ("\n".join(lines) + "\n", self._prep_text())
         self._dirty = False
         return self._inputs
 
-    def run_query(self, sparql, base=None):
-        nq, prep = self._evaluator_inputs()
-        with tempfile.TemporaryDirectory() as td:
-            qp, rp, pp = (os.path.join(td, n) for n in ("q.nq", "q.rq", "prep.txt"))
-            open(qp, "w").write(nq)
-            open(rp, "w").write(sparql)
-            open(pp, "w").write(prep)
-            proc = subprocess.run(
-                [EVALUATOR, qp, rp, base or self.names.root, pp],
-                capture_output=True, text=True, timeout=30,
-            )
-        lines = proc.stdout.splitlines()
-        if proc.returncode == 3 and lines and lines[0].startswith("REFUSED\t"):
+    def _parse_protocol(self, lines, exit_code):
+        """The phext-sparql line protocol, shared by the subprocess path
+        and the phext-serve /query path (identical bytes, X-Exit header
+        standing in for the process exit code)."""
+        if exit_code == 3 and lines and lines[0].startswith("REFUSED\t"):
             _r, construct, message = lines[0].split("\t", 2)
             raise Refused(construct, message)
-        if proc.returncode != 0:
-            raise QueryError(lines[0] if lines else f"evaluator exit {proc.returncode}")
+        if exit_code != 0:
+            raise QueryError(lines[0] if lines else f"evaluator exit {exit_code}")
         notes, i = [], 0
         prop_equiv, class_subs = ontology_prep()
         known = set(prop_equiv) | set(class_subs)
@@ -1022,11 +1063,156 @@ class Soul:
             triples = []
             for line in lines[i + 1:]:
                 s, j = parse_nt_term(line)
-                p, j = parse_nt_term(line, j + 1)
+                po, j = parse_nt_term(line, j + 1)
                 o, _j = parse_nt_term(line, j + 1)
-                triples.append((s, p, o))
+                triples.append((s, po, o))
             return {"kind": "triples", "triples": triples, "notes": notes}
         raise QueryError(f"evaluator: unexpected output {head!r}")
+
+    # -- holo bridge sync ---------------------------------------------------
+    def _coord_tids(self, c, reg):
+        """Map a changed scroll coordinate to transcript ids it can
+        affect: {tid} for a transcript region, set() for the notes /
+        summaries region (global section only), None for 'unknown /
+        registry' (affects everything). reg: slot -> tid."""
+        try:
+            lib, vol, _book, _ch, _sec, _scroll = parse_coord(c)
+        except Exception:
+            return None
+        if lib == 1 and vol == 1:
+            return None
+        if lib in (1, 3) and vol >= 2:
+            tid = reg.get(vol - 2)
+            return {tid} if tid is not None else None
+        if lib == 2:
+            return set()
+        return None
+
+    def _collect_external(self):
+        """Poll the bridge commit feed once. Returns None (no change),
+        ("full", seq), or ("diff", seq, affected_tids, global_hit).
+        Invalidates the transcript caches of affected tids."""
+        seq = self.store.seq(self.file)
+        if seq == self._holo_seq:
+            return None
+        if seq < self._holo_seq:
+            self._transcript_cache.clear()
+            return ("full", seq)
+        upd = self.store.updates(self.file, self._holo_seq)
+        if isinstance(upd, dict):  # {"truncated": true}
+            self._transcript_cache.clear()
+            return ("full", seq)
+        reg = {slot: tid for tid, slot in self.registry()}
+        affected, global_hit = set(), False
+        for entry in upd:
+            for c in entry.get("coords", []):
+                tids = self._coord_tids(c, reg)
+                if tids is None:
+                    self._transcript_cache.clear()
+                    return ("full", seq)
+                if tids:
+                    affected |= tids
+                else:
+                    global_hit = True
+        for tid in affected:
+            self._invalidate_tid(tid)
+        return ("diff", seq, affected, global_hit)
+
+    def _holo_poll_cache(self):
+        """all_quads()'s external-change poll (holo, after first sync):
+        invalidate touched transcripts; the next run_query re-syncs the
+        bridge quad set with a full replace."""
+        got = self._collect_external()
+        if got is not None:
+            self._holo_needs_replace = True
+            self._holo_seq = got[1]
+
+    def _derive_sections(self):
+        """section key -> set of NT lines, plus the lines in all_quads
+        order. Section keys are tids, plus '__global__'."""
+        sections, ordered = {}, []
+        self._holo_in_sync = True
+        try:
+            for tid, _slot in self.registry():
+                lines = [self._quad_line(q) for q in self._transcript_quads(tid)]
+                sections[tid] = set(lines)
+                ordered += lines
+            glines = [self._quad_line(q) for q in self._global_quads()]
+            sections["__global__"] = set(glines)
+            ordered += glines
+        finally:
+            self._holo_in_sync = False
+        return sections, ordered
+
+    def _holo_sync(self):
+        """Keep the bridge's maintained quad set equal to this soul's
+        projected quads: full replace on first use / truncation, else a
+        per-tid add/remove diff driven by the commit feed."""
+        if not self._holo_synced or self._holo_needs_replace:
+            seq0 = self.store.seq(self.file)
+            sections, ordered = self._derive_sections()
+            self.store.quads(self.file, {"replace": ordered})
+            self._holo_sections = sections
+            self._holo_seq = seq0
+            self._holo_synced = True
+            self._holo_needs_replace = False
+            return
+        got = self._collect_external()
+        if got is None:
+            return
+        if got[0] == "full":
+            self._holo_needs_replace = True
+            self._holo_sync()
+            return
+        _kind, seq, affected, _global_hit = got
+        # Any change can move the global section (recent turns derive
+        # from all transcripts), so it is re-derived on every diff.
+        keys = list(affected) + ["__global__"]
+        self._holo_in_sync = True
+        try:
+            fresh = {}
+            for tid in affected:
+                fresh[tid] = {self._quad_line(q) for q in self._transcript_quads(tid)}
+            fresh["__global__"] = {self._quad_line(q) for q in self._global_quads()}
+        finally:
+            self._holo_in_sync = False
+        add, remove = [], []
+        for k in keys:
+            old = self._holo_sections.get(k, set())
+            new = fresh[k]
+            add += sorted(new - old)
+            remove += sorted(old - new)
+            self._holo_sections[k] = new
+        # A tid that vanished from the registry leaves stale lines.
+        for k in list(self._holo_sections):
+            if k != "__global__" and k not in {tid for tid, _s in self.registry()}:
+                remove += sorted(self._holo_sections.pop(k))
+        if add or remove:
+            payload = {}
+            if add:
+                payload["add"] = add
+            if remove:
+                payload["remove"] = remove
+            self.store.quads(self.file, payload)
+        self._holo_seq = seq
+
+    def run_query(self, sparql, base=None):
+        if self._is_holo:
+            self._holo_sync()
+            exit_code, body = self.store.query(
+                self.file, sparql, base or self.names.root, self._prep_text())
+            return self._parse_protocol(body.splitlines(), exit_code)
+        nq, prep = self._evaluator_inputs()
+        with tempfile.TemporaryDirectory() as td:
+            qp, rp, pp = (os.path.join(td, n) for n in ("q.nq", "q.rq", "prep.txt"))
+            open(qp, "w").write(nq)
+            open(rp, "w").write(sparql)
+            open(pp, "w").write(prep)
+            proc = subprocess.run(
+                [EVALUATOR, qp, rp, base or self.names.root, pp],
+                capture_output=True, text=True, timeout=30,
+            )
+        return self._parse_protocol(proc.stdout.splitlines(), proc.returncode)
 
     def query_rows(self, sparql):
         """graph.rs's query_rows: variable -> plain value, per row."""

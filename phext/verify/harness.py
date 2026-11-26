@@ -393,11 +393,11 @@ def scroll_snapshot(store, fname):
 
 def seam_phase():
     import ravel_backend as rb
-    from phextio import PhextStore
+    from phextio import make_store
 
     print("== seam phase ==")
     data = os.environ["HARNESS_DATA1"]
-    store = PhextStore(data, int(os.environ["HARNESS_SQ1"]))
+    store = make_store(data, int(os.environ["HARNESS_SQ1"]))
     store.start()
     timings = {}
     try:
@@ -670,12 +670,12 @@ def outside_phase():
     C-1) passed 65/65 undetected. These checks fail against the v1 backend
     and pass against the corrected one."""
     import ravel_backend as rb
-    from phextio import PhextStore
+    from phextio import make_store
 
     print("== outside phase ==")
     SUB = "https://repolex.ai/ontology/subtexture/"
     data = os.environ.get("HARNESS_DATA3") or tempfile.mkdtemp(prefix="ravel-outside-")
-    store = PhextStore(data, int(os.environ.get("HARNESS_SQ3", "18997")))
+    store = make_store(data, int(os.environ.get("HARNESS_SQ3", "18997")))
     store.start()
     try:
         soul = rb.Soul(store, "soul-a", rb.Names(ROOT_A, "spacegoat"), machine_owner=None).open()

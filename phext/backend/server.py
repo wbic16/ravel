@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
 import ravel_backend as rb
-from phextio import PhextStore
+from phextio import make_store
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -225,7 +225,7 @@ def main():
     data = os.environ.get("RAVEL_PHEXT_DATA", os.path.join(HERE, "data"))
     port = int(os.environ.get("RAVEL_PORT", "7881"))
     sq_port = int(os.environ.get("RAVEL_SQ_PORT", "18991"))
-    store = PhextStore(data, sq_port)
+    store = make_store(data, sq_port)
     store.start()
     reg = Registry(store, data)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(reg, server=None))
