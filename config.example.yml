@@ -2,7 +2,7 @@
 # configuration. Copy to ~/.config/ravel/config.yml and edit.
 #
 # Every entry under souls: is a soul repository (home-relative `~/` or absolute).
-# raveld keeps that soul's transcript mirror, memory logs, and oxigraph store at
+# raveld keeps that soul's transcript mirror, memory logs, and phext graph store (store.nq text) at
 # <repo>/.ravel/_ignore/ and identifies the soul by the first six characters of
 # its genesis commit — the same id pan, git-lex, Horae and Syrinx use.
 # Nothing here is typed in but the paths.
