@@ -771,7 +771,8 @@ pub fn reword_parallel(
                     ));
                 }
                 Err(e) => {
-                    r.stopped.get_or_insert(format!("merge #{}: {e:#}", memory::block_id(b)));
+                    r.stopped
+                        .get_or_insert(format!("merge #{}: {e:#}", memory::block_id(b)));
                 }
             }
         }
@@ -877,7 +878,11 @@ pub fn load_unread(
     let since = unread
         .iter()
         .flat_map(|n| {
-            let first = if n.from_start { first_input(&n.conv) } else { None };
+            let first = if n.from_start {
+                first_input(&n.conv)
+            } else {
+                None
+            };
             n.conv
                 .turns
                 .iter()
@@ -1189,8 +1194,8 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     let names = crate::names::Names::for_soul(repo)?;
     let nt = memory_log::project_nt(&names, &ms, &sums);
     v.nt_triples = nt.lines().count();
-    let mem = oxigraph::store::Store::new()?;
-    mem.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
+    let mem = crate::graph::Store::new()?;
+    mem.load_nt(&nt, None)?;
     let dangling = crate::graph::query_rows(
         &mem,
         &format!(
@@ -1209,7 +1214,7 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     }
     // Every cited turn is a Turn node in the soul's own store.
     let store_dir = repo.join(crate::sync::STORE_SUBDIR);
-    if store_dir.join("CURRENT").exists() {
+    if store_dir.join(crate::graph::STORE_FILE).exists() {
         let _hold = crate::graph::reading(&store_dir);
         let store = crate::graph::open_read_only(&store_dir)?;
         cited.sort();
@@ -1279,7 +1284,10 @@ mod tests {
     fn real_unread_is_the_same_read_whole_or_from_its_place() {
         let repo = std::path::PathBuf::from(std::env::var("RAVEL_TRIAL_REPO").unwrap());
         let dir = std::path::PathBuf::from(std::env::var("RAVEL_TRIAL_DIR").unwrap());
-        assert!(!dir.starts_with(&repo), "the trial folder must be outside the soul");
+        assert!(
+            !dir.starts_with(&repo),
+            "the trial folder must be outside the soul"
+        );
         let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
         let souls: Vec<(std::path::PathBuf, String)> = std::env::var("RAVEL_TRIAL_SOULS")
             .unwrap()
@@ -1288,7 +1296,11 @@ mod tests {
             .collect();
         let sp = Speakers {
             agent: name(&repo),
-            peers: souls.iter().map(|s| s.1.clone()).filter(|n| *n != name(&repo)).collect(),
+            peers: souls
+                .iter()
+                .map(|s| s.1.clone())
+                .filter(|n| *n != name(&repo))
+                .collect(),
             human: "human".into(),
         };
         let mut done = MemoryLog::for_soul(&repo).extracted().unwrap();

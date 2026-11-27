@@ -469,7 +469,7 @@ pub fn project_nt(
 /// daemon's gate: this opens the store read-write.
 pub fn project_into_store(repo: &Path) -> Result<()> {
     let store_dir = repo.join(crate::sync::STORE_SUBDIR);
-    if !store_dir.join("CURRENT").exists() {
+    if !store_dir.join(crate::graph::STORE_FILE).exists() {
         return Ok(());
     }
     let names = crate::names::Names::for_soul(repo)?;
@@ -482,7 +482,7 @@ pub fn project_into_store(repo: &Path) -> Result<()> {
     let stamp_file = repo.join(MEMORY_SUBDIR).join("projected.stamp");
     let stamp = projection_stamp(repo, &names);
     let store = crate::readdress::open_current(repo, &names)?;
-    let graph = oxigraph::model::NamedNode::new(names.memory_graph())?;
+    let graph = crate::graph::NamedNode::new(names.memory_graph())?;
     if stamp.is_some()
         && std::fs::read_to_string(&stamp_file).ok() == stamp
         && store.contains_named_graph(&graph)?
@@ -524,26 +524,26 @@ fn projection_stamp(repo: &Path, names: &crate::names::Names) -> Option<String> 
 
 /// The same, into a store the caller already has open.
 pub fn project_into(
-    store: &oxigraph::store::Store,
+    store: &crate::graph::Store,
     repo: &Path,
     names: &crate::names::Names,
 ) -> Result<()> {
-    use crate::graph::{describe_graph, drop_graph, GraphKind};
-    use oxigraph::model::NamedNode;
+    use crate::graph::{describe_graph, drop_graph, GraphKind, NamedNode};
     let log = MemoryLog::for_soul(repo);
     let memories = log.memories()?;
     let summaries = log.summaries()?;
     // The graph was called `memory-v1` until 0.10.0; that one goes for good.
-    drop_graph(store, &NamedNode::new(names.graph(crate::names::OLD_MEMORY_GRAPH))?)?;
+    drop_graph(
+        store,
+        &NamedNode::new(names.graph(crate::names::OLD_MEMORY_GRAPH))?,
+    )?;
     let g = NamedNode::new(names.memory_graph())?;
     drop_graph(store, &g)?;
     if memories.is_empty() {
         store.flush()?;
         return Ok(());
     }
-    let parser = oxigraph::io::RdfParser::from_format(oxigraph::io::RdfFormat::NTriples)
-        .with_default_graph(g.clone());
-    store.load_from_reader(parser, project_nt(names, &memories, &summaries).as_bytes())?;
+    store.load_nt(&project_nt(names, &memories, &summaries), Some(g.as_str()))?;
     describe_graph(store, names, &g, GraphKind::Memory)?;
     store.flush()?;
     Ok(())
@@ -614,7 +614,11 @@ mod tests {
         let two = super::projection_stamp(&repo, &bare).unwrap();
         assert_ne!(two, one, "a log that grew");
         let named = crate::names::Names::new("squad", "someone").unwrap();
-        assert_ne!(super::projection_stamp(&repo, &named).unwrap(), two, "other addresses");
+        assert_ne!(
+            super::projection_stamp(&repo, &named).unwrap(),
+            two,
+            "other addresses"
+        );
         std::fs::remove_dir_all(&repo).ok();
     }
 
@@ -719,10 +723,8 @@ mod tests {
         assert!(nt.contains(&format!("{} {rel} {} .", m("0-1"), m("m1"))));
         assert!(nt.contains(&format!("{} {rel} {} .", m("0-3"), m("0-1"))));
         assert!(nt.contains(&format!("{} {rel} {} .", m("0-3"), m("2-3"))));
-        let store = oxigraph::store::Store::new().unwrap();
-        store
-            .load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())
-            .unwrap();
+        let store = crate::graph::Store::new().unwrap();
+        store.load_nt(&nt, None).unwrap();
     }
 
     /// ravel.ttl stands on the Subtexture base and on nothing of git-lex's:
@@ -732,10 +734,8 @@ mod tests {
     fn every_base_term_ravel_names_is_declared_in_the_shipped_subtexture_ttl() {
         let ravel = include_str!("../ontology/ravel/ravel.ttl");
         let base = include_str!("../ontology/subtexture/subtexture.ttl");
-        let store = oxigraph::store::Store::new().unwrap();
-        store
-            .load_from_reader(oxigraph::io::RdfFormat::Turtle, base.as_bytes())
-            .expect("subtexture.ttl parses");
+        let store = crate::graph::Store::new().unwrap();
+        store.load_ttl(base, None).expect("subtexture.ttl parses");
         let code: String = ravel
             .lines()
             .filter(|l| !l.trim_start().starts_with('#'))
@@ -766,13 +766,8 @@ mod tests {
         for t in terms {
             let q = format!("ASK {{ <https://repolex.ai/ontology/subtexture/{t}> a ?k }}");
             let ok = matches!(
-                oxigraph::sparql::SparqlEvaluator::new()
-                    .parse_query(&q)
-                    .unwrap()
-                    .on_store(&store)
-                    .execute()
-                    .unwrap(),
-                oxigraph::sparql::QueryResults::Boolean(true)
+                crate::graph::eval_query(&store, &q).unwrap(),
+                crate::graph::QueryResults::Boolean(true)
             );
             assert!(
                 ok,
@@ -786,10 +781,8 @@ mod tests {
     #[test]
     fn the_ontology_declares_every_memory_term_the_projection_emits() {
         let ttl = include_str!("../ontology/ravel/ravel.ttl");
-        let store = oxigraph::store::Store::new().unwrap();
-        store
-            .load_from_reader(oxigraph::io::RdfFormat::Turtle, ttl.as_bytes())
-            .expect("ravel.ttl parses");
+        let store = crate::graph::Store::new().unwrap();
+        store.load_ttl(ttl, None).expect("ravel.ttl parses");
         let ms: Vec<Memory> = (0..2).map(mem).collect();
         let mut s = HashMap::new();
         s.insert("0-1".to_string(), sum((0, 2), "x"));
@@ -806,13 +799,8 @@ mod tests {
         for t in terms {
             let q = format!("ASK {{ <{ns}{t}> a ?k }}");
             let ok = matches!(
-                oxigraph::sparql::SparqlEvaluator::new()
-                    .parse_query(&q)
-                    .unwrap()
-                    .on_store(&store)
-                    .execute()
-                    .unwrap(),
-                oxigraph::sparql::QueryResults::Boolean(true)
+                crate::graph::eval_query(&store, &q).unwrap(),
+                crate::graph::QueryResults::Boolean(true)
             );
             assert!(ok, "ravel:{t} is emitted but not declared in ravel.ttl");
         }

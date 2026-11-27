@@ -14,19 +14,19 @@
 //! old address still quotes it. The memory graph is not copied: it is
 //! rebuilt from the soul's memory logs under its new name.
 
-use crate::graph::{self, GraphKind};
+use crate::graph::{
+    self, GraphKind, GraphName, NamedNode, NamedOrBlankNode, Quad, Store, Term, Triple,
+};
 use crate::names::{Names, OLD_MEMORY_GRAPH};
 use anyhow::{bail, Context, Result};
-use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
-use oxigraph::store::Store;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Beside the store while it is being built; a leftover one is from a run
 /// that was stopped, and is rebuilt from nothing.
-const BUILDING: &str = "oxigraph.readdressing";
+const BUILDING: &str = "phext.readdressing";
 /// What the old store is renamed to.
-pub const KEPT: &str = "oxigraph.before-0.10-addresses";
+pub const KEPT: &str = "phext.before-0.10-addresses";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Moved {
@@ -108,7 +108,10 @@ pub fn move_store(store_dir: &Path, names: &Names) -> Result<Moved> {
     let old_base = Names::bare().base();
     let new_base = names.base();
     if old_base == new_base {
-        bail!("{} has no squad and username; its addresses do not move", store_dir.display());
+        bail!(
+            "{} has no squad and username; its addresses do not move",
+            store_dir.display()
+        );
     }
     let building = sibling(store_dir, BUILDING);
     let kept = sibling(store_dir, KEPT);
@@ -159,37 +162,27 @@ pub fn move_store(store_dir: &Path, names: &Names) -> Result<Moved> {
     let mut copied = 0usize;
     let mut memory_left_out = 0usize;
     let mut graphs: BTreeSet<String> = BTreeSet::new();
-    {
-        let mut loader = new.bulk_loader();
-        let moved = old.iter().filter_map(|q| {
-            let q = match q {
-                Ok(q) => q,
-                Err(e) => return Some(Err(anyhow::Error::from(e))),
-            };
-            if matches!(&q.graph_name, GraphName::NamedNode(g) if g.as_str() == old_memory) {
-                memory_left_out += 1;
-                return None;
+    for q in old.iter() {
+        let q = q?;
+        if matches!(&q.graph_name, GraphName::NamedNode(g) if g.as_str() == old_memory) {
+            memory_left_out += 1;
+            continue;
+        }
+        let graph_name = match q.graph_name {
+            GraphName::NamedNode(g) => {
+                let g = iri(g);
+                graphs.insert(g.as_str().to_string());
+                GraphName::NamedNode(g)
             }
-            let graph_name = match q.graph_name {
-                GraphName::NamedNode(g) => {
-                    let g = iri(g);
-                    if !graphs.contains(g.as_str()) {
-                        graphs.insert(g.as_str().to_string());
-                    }
-                    GraphName::NamedNode(g)
-                }
-                other => other,
-            };
-            copied += 1;
-            Some(Ok(Quad::new(
-                subject(q.subject, &iri),
-                iri(q.predicate),
-                term(q.object, &iri),
-                graph_name,
-            )))
-        });
-        loader.load_ok_quads::<anyhow::Error, anyhow::Error>(moved)?;
-        loader.commit()?;
+            other => other,
+        };
+        copied += 1;
+        new.insert(&Quad::new(
+            subject(q.subject, &iri),
+            iri(q.predicate),
+            term(q.object, &iri),
+            graph_name,
+        ))?;
     }
     for g in &graphs {
         let g = NamedNode::new(g)?;
@@ -231,7 +224,6 @@ pub fn move_store(store_dir: &Path, names: &Names) -> Result<Moved> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxigraph::io::RdfFormat;
 
     const OLD: &str = r#"
 <https://repolex.ai/ravel/Turn/t1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://repolex.ai/ontology/ravel/Turn> <https://repolex.ai/ravel/NamedGraph/a> .
@@ -255,7 +247,7 @@ mod tests {
         let store_dir = dir.join("oxigraph");
         {
             let s = graph::open(&store_dir).unwrap();
-            s.load_from_reader(RdfFormat::NQuads, OLD.as_bytes()).unwrap();
+            s.load_nq(OLD).unwrap();
             s.flush().unwrap();
         }
         let names = Names::new("7r1pl3f0rc3", "spacegoat").unwrap();
@@ -264,7 +256,10 @@ mod tests {
         assert_eq!(moved.memory_left_out, 1);
         assert_eq!(moved.graphs, 2);
         assert_eq!(moved.turns, 2);
-        assert!(moved.kept.join("CURRENT").exists(), "the old store is kept");
+        assert!(
+            moved.kept.join(crate::graph::STORE_FILE).exists(),
+            "the old store is kept"
+        );
 
         let s = graph::open(&store_dir).unwrap();
         assert!(!is_old(&s, &names).unwrap());
@@ -331,13 +326,36 @@ mod tests {
             let r = "https://repolex.ai/ontology/ravel/";
             println!("{label}");
             println!("  statements        {}", s.len().unwrap());
-            println!("  named graphs      {}", one("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"));
-            println!("  turns             {}", one(&format!("SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE {{ GRAPH ?g {{ ?t a <{r}Turn> }} }}")));
-            println!("  turn rows         {}", one(&format!("SELECT (COUNT(?t) AS ?n) WHERE {{ GRAPH ?g {{ ?t a <{r}Turn> }} }}")));
-            println!("  memory notes      {}", one(&format!("SELECT (COUNT(?m) AS ?n) WHERE {{ GRAPH ?g {{ ?m <{r}memoryLevel> 0 }} }}")));
+            println!(
+                "  named graphs      {}",
+                one("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }")
+            );
+            println!(
+                "  turns             {}",
+                one(&format!(
+                    "SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE {{ GRAPH ?g {{ ?t a <{r}Turn> }} }}"
+                ))
+            );
+            println!(
+                "  turn rows         {}",
+                one(&format!(
+                    "SELECT (COUNT(?t) AS ?n) WHERE {{ GRAPH ?g {{ ?t a <{r}Turn> }} }}"
+                ))
+            );
+            println!(
+                "  memory notes      {}",
+                one(&format!(
+                    "SELECT (COUNT(?m) AS ?n) WHERE {{ GRAPH ?g {{ ?m <{r}memoryLevel> 0 }} }}"
+                ))
+            );
             println!("  memory merges     {}", one(&format!("SELECT (COUNT(?m) AS ?n) WHERE {{ GRAPH ?g {{ ?m <{r}memoryLevel> ?l FILTER(?l > 0) }} }}")));
             println!("  note-to-turn links that land on a turn  {}", one(&format!("SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH ?mg {{ ?m <{r}memoryLevel> 0 ; <{r}relatedToId> ?t }} FILTER EXISTS {{ GRAPH ?g {{ ?t a <{r}Turn> }} }} }}")));
-            println!("  graphs described  {}", one(&format!("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE {{ ?g <{r}visibility> ?v }}")));
+            println!(
+                "  graphs described  {}",
+                one(&format!(
+                    "SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE {{ ?g <{r}visibility> ?v }}"
+                ))
+            );
             println!("  old addresses     {}", one("SELECT (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?s), \"https://repolex.ai/ravel/\")) }"));
         };
         {
@@ -346,7 +364,10 @@ mod tests {
         }
         let t = std::time::Instant::now();
         let s = open_current(&repo, &names).unwrap();
-        println!("moved and memory rebuilt in {:.1}s", t.elapsed().as_secs_f64());
+        println!(
+            "moved and memory rebuilt in {:.1}s",
+            t.elapsed().as_secs_f64()
+        );
         counts(&s, "AFTER");
         // What an outside caller sees: base names, and a short address read
         // against this soul's root.
@@ -360,7 +381,7 @@ mod tests {
         ] {
             let t = std::time::Instant::now();
             let (r, _) = crate::outside::run(&s, &q, names.root()).unwrap();
-            let oxigraph::sparql::QueryResults::Solutions(sols) = r else { panic!() };
+            let crate::graph::QueryResults::Solutions(sols) = r else { panic!() };
             let rows: Vec<_> = sols.map(|r| r.unwrap()).collect();
             println!("  outside: {label} = {}  ({:.2}s)", rows[0].iter().map(|(_, v)| v.to_string()).collect::<String>(), t.elapsed().as_secs_f64());
         }
@@ -370,7 +391,7 @@ mod tests {
     fn a_repo_with_no_squad_is_never_old() {
         let dir = scratch("bare");
         let s = graph::open(dir.join("oxigraph")).unwrap();
-        s.load_from_reader(RdfFormat::NQuads, OLD.as_bytes()).unwrap();
+        s.load_nq(OLD).unwrap();
         assert!(!is_old(&s, &Names::bare()).unwrap());
         assert!(is_old(&s, &Names::new("7r1pl3f0rc3", "spacegoat").unwrap()).unwrap());
         drop(s);

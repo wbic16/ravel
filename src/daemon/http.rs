@@ -18,15 +18,13 @@
 //! Reads open the store read-only; only the sync pass writes.
 
 use super::Daemon;
+use crate::graph::{CancellationToken, QueryResults, Store, Term};
 use crate::{graph, sync};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use oxigraph::model::Term;
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-use oxigraph::store::Store;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -76,7 +74,10 @@ pub fn router(d: Shared) -> Router {
         .route("/ravel/{org}/{store}/health", get(soul_health))
         .route("/ravel/{org}/{store}/stats", get(soul_stats))
         .layer(axum::middleware::from_fn(listed_while_answered))
-        .layer(axum::middleware::from_fn_with_state(d.clone(), super::gate::check))
+        .layer(axum::middleware::from_fn_with_state(
+            d.clone(),
+            super::gate::check,
+        ))
         .with_state(d)
 }
 
@@ -400,7 +401,7 @@ fn open_store(soul: &super::registry::Soul) -> anyhow::Result<Opened> {
     let dir = soul.path.join(sync::STORE_SUBDIR);
     // Never create a store from a read: a mis-aimed path must refuse, not
     // litter an empty store and report a trustworthy-looking zero.
-    if !dir.join("CURRENT").exists() {
+    if !dir.join(crate::graph::STORE_FILE).exists() {
         anyhow::bail!(
             "{} has no store yet at {} — nothing has been synced",
             soul.path.display(),
@@ -422,11 +423,7 @@ fn literal_value(t: &Term) -> String {
 }
 
 fn scalar(store: &Store, q: &str) -> anyhow::Result<String> {
-    if let QueryResults::Solutions(mut sols) = SparqlEvaluator::new()
-        .parse_query(q)?
-        .on_store(store)
-        .execute()?
-    {
+    if let QueryResults::Solutions(mut sols) = crate::graph::eval_query(store, q)? {
         if let Some(s) = sols.next() {
             let s = s?;
             // Bound to a local first: as a block's tail expression the
@@ -464,7 +461,9 @@ async fn soul_stats(
         }
     }
     let began = std::time::Instant::now();
-    let shown = soul.address().unwrap_or_else(|| soul.path.display().to_string());
+    let shown = soul
+        .address()
+        .unwrap_or_else(|| soul.path.display().to_string());
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let store = open_store(&soul)?;
         let g = "GRAPH ?g { ?s ?p ?o }";
@@ -479,11 +478,10 @@ async fn soul_stats(
         let latest = scalar(&store, &format!("SELECT (MAX(?t) AS ?m) WHERE {{ GRAPH ?g {{ ?s ?p ?t }} {dt} }}"))?;
         let claims = scalar(&store, "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ?tt } }")?;
         let mut top = Vec::new();
-        if let QueryResults::Solutions(sols) = SparqlEvaluator::new()
-            .parse_query("SELECT ?p (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?p ORDER BY DESC(?n) LIMIT 20")?
-            .on_store(&store)
-            .execute()?
-        {
+        if let QueryResults::Solutions(sols) = crate::graph::eval_query(
+            &store,
+            "SELECT ?p (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?p ORDER BY DESC(?n) LIMIT 20",
+        )? {
             for s in sols {
                 let s = s?;
                 let p = s.get("p").map(|t| t.to_string()).unwrap_or_default();
@@ -527,8 +525,8 @@ const STATS_STAND_FOR: std::time::Duration = std::time::Duration::from_secs(300)
 
 type StatsSlot = Arc<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>>;
 
-fn stats_kept() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StatsSlot>>
-{
+fn stats_kept(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StatsSlot>> {
     static S: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StatsSlot>>,
     > = std::sync::OnceLock::new();
@@ -619,7 +617,7 @@ enum Answer {
 fn answer(
     soul: &super::registry::Soul,
     text: &str,
-    stop: oxigraph::sparql::CancellationToken,
+    stop: CancellationToken,
 ) -> anyhow::Result<(Answer, Vec<String>)> {
     let store = open_store(soul)?;
     let names = crate::names::Names::for_soul(&soul.path)?;
@@ -633,8 +631,7 @@ fn answer(
     // ends at 2.04 s. What spareval does on a cancel is turn each row still
     // to come into an error, so a cancelled query can still cost a moment;
     // raveld's own memory watch stands behind it.
-    let (results, report) =
-        crate::outside::run_until(&store, text, names.root(), Some(stop))?;
+    let (results, report) = crate::outside::run_until(&store, text, names.root(), Some(stop))?;
     let notes = crate::outside::notes(&report);
     let a = match results {
         QueryResults::Solutions(sols) => {
@@ -790,7 +787,9 @@ fn watch_own_memory() {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
         let Some(held) = memory_held() else { continue };
-        if held >= MEMORY_IS_NOTED && noted.is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 30) {
+        if held >= MEMORY_IS_NOTED
+            && noted.is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 30)
+        {
             noted = Some(std::time::Instant::now());
             super::log(format!(
                 "memory note: {:.1} GB held; under way:\n  {}",
@@ -841,7 +840,7 @@ fn watch_own_memory() {
 
 /// Stops the work when the handler is dropped, which is what happens when
 /// the caller hangs up before the answer.
-struct StopWhenDropped(oxigraph::sparql::CancellationToken);
+struct StopWhenDropped(CancellationToken);
 
 impl Drop for StopWhenDropped {
     fn drop(&mut self) {
@@ -860,10 +859,7 @@ fn one_line(text: &str) -> String {
 
 /// An outside query, with a place at the store, a time limit, and a line in
 /// the log when it was slow, stopped or abandoned.
-async fn ask(
-    soul: super::registry::Soul,
-    text: String,
-) -> Result<(Answer, Vec<String>), ApiError> {
+async fn ask(soul: super::registry::Soul, text: String) -> Result<(Answer, Vec<String>), ApiError> {
     let name = soul
         .address()
         .unwrap_or_else(|| soul.path.display().to_string());
@@ -879,7 +875,7 @@ async fn ask(
             ),
         ));
     };
-    let stop = oxigraph::sparql::CancellationToken::new();
+    let stop = CancellationToken::new();
     let hung_up = StopWhenDropped(stop.clone());
     let (for_work, shown, began) = (stop.clone(), one_line(&text), std::time::Instant::now());
     let who = name.clone();
@@ -1058,7 +1054,10 @@ mod tests {
 
     async fn status(req: reqwest::RequestBuilder) -> (u16, bool) {
         let r = req.send().await.unwrap();
-        (r.status().as_u16(), r.headers().contains_key("www-authenticate"))
+        (
+            r.status().as_u16(),
+            r.headers().contains_key("www-authenticate"),
+        )
     }
 
     #[tokio::test]
@@ -1069,20 +1068,43 @@ mod tests {
         assert_eq!(status(c.get(format!("{base}/ravel/health"))).await.0, 200);
         assert_eq!(status(c.get(format!("{base}/ravel/stores"))).await.0, 200);
         // No token: stopping raveld and writing are refused, and say how to ask.
-        assert_eq!(status(c.post(format!("{base}/ravel/shutdown"))).await, (401, true));
-        assert_eq!(status(c.post(format!("{base}/ravel/sync"))).await, (401, true));
-        assert_eq!(status(c.post(format!("{base}/ravel/7r1pl3f0rc3/nobody/sync"))).await, (401, true));
+        assert_eq!(
+            status(c.post(format!("{base}/ravel/shutdown"))).await,
+            (401, true)
+        );
+        assert_eq!(
+            status(c.post(format!("{base}/ravel/sync"))).await,
+            (401, true)
+        );
+        assert_eq!(
+            status(c.post(format!("{base}/ravel/7r1pl3f0rc3/nobody/sync"))).await,
+            (401, true)
+        );
         // No token on a read passes the gate for now; no such soul, so 404.
-        assert_eq!(status(c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))).await.0, 404);
+        assert_eq!(
+            status(c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats")))
+                .await
+                .0,
+            404
+        );
         // A token that is sent and is not good is refused, reads included.
-        let bad = c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats")).bearer_auth("abc.def.ghi");
+        let bad = c
+            .get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))
+            .bearer_auth("abc.def.ghi");
         assert_eq!(status(bad).await, (401, true));
         let basic = c
             .get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))
             .header("authorization", "Basic abc");
         assert_eq!(status(basic).await.0, 401);
         // /health still answers after all of that: nothing was stopped.
-        let h: Value = c.get(format!("{base}/ravel/health")).send().await.unwrap().json().await.unwrap();
+        let h: Value = c
+            .get(format!("{base}/ravel/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(h["identity"]["reads_need_a_token"], false);
         assert_eq!(h["identity"]["squaddies_with_a_key"], 0);
     }
