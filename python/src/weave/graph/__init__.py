@@ -2,13 +2,13 @@
 
 The monolog is canonical as append-only JSONL (greppable, dependency-free, the
 hot path). The graph is a DERIVED projection: parse the JSONL into RDF 1.2
-N-Triples, bulk-load into pyoxigraph, and you can run SPARQL cross-reader
+N-Triples, bulk-load into the phext graph layer, and you can run SPARQL cross-reader
 queries ("turns where cadence burst AND emojikey present"). The .nt and the
 store are caches — `rm` them and rebuild from the JSONL any time. Same
 discipline as repolex: source isn't stored AS triples, it's parsed INTO them.
 
 Vocab mapping (each W3C standard owns one link of the chain), verified against
-the RDF 1.2 / PROV-O / Web-Annotation specs and probed on pyoxigraph 0.5.6:
+the RDF 1.2 / PROV-O / Web-Annotation specs and probed on the phext evaluator:
 
     reader      -> prov:SoftwareAgent          (the detector)
     a run       -> prov:Activity (used/atTime)  (one detector pass)
