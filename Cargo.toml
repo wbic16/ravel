@@ -24,8 +24,11 @@ name = "ravel"
 path = "src/bin/ravel.rs"
 
 [dependencies]
-# Same store as Pool — rdf-12 for triple terms (squad standard, not RDF-star).
-oxigraph = { version = "0.5.6", features = ["rdf-12"] }
+# The graph layer is phext-only (2026-11-27): the store and the SPARQL
+# evaluator are the phext-serve library in this repo (holo-phext quad set
+# + the SPARQL-subset evaluator), path-depended on here — one evaluator,
+# one store, two seats (the phext-serve binary and this daemon).
+phext-serve = { path = "phext/serve" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
@@ -38,10 +41,9 @@ libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde_yaml = "0.9"
-# Outside queries are prepared by the stack's shared crate (m4xx's) before
-# the store sees them: ontology rewriting now, short addresses at the cutover.
-calamus = { git = "https://github.com/repolex-ai/calamus", features = ["turtle"] }
+# Outside queries are prepared in-tree (src/outside.rs): the ontology
+# rewrite the calamus crate used to perform is applied as Prep data
+# derived from the shipped ontologies, calamus's own closure ported —
+# the same port the phext backend runs (ontology_prep()).
 # Who is asking, and whether they may: the stack's shared crate (tr1pl3x's).
 tessera = { git = "https://github.com/repolex-ai/tessera", rev = "1142eb66066624ebfa405b7679b3731e72b8fc4f" }
-# The parsed-query type calamus and oxigraph share; oxigraph picks the 0.4.x.
-spargebra = { version = "0.4.6", features = ["sparql-12"] }
