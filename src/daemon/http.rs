@@ -19,11 +19,7 @@
 
 use super::Daemon;
 use crate::{graph, sync};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use phext_serve::http::{pct_decode_path, Request, Response};
 use crate::graph::{CancellationToken, QueryResults, Store, Term};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -31,74 +27,98 @@ use std::sync::Arc;
 
 type Shared = Arc<Daemon>;
 
-pub struct ApiError(StatusCode, String);
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
-    }
-}
+pub struct ApiError(u16, String);
 
 fn bad(e: impl std::fmt::Display) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, format!("{e:#}"))
+    ApiError(400, format!("{e:#}"))
 }
 
 fn not_found(e: impl std::fmt::Display) -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, format!("{e:#}"))
+    ApiError(404, format!("{e:#}"))
 }
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
-    ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+    ApiError(500, format!("{e:#}"))
 }
 
-/// Every route, behind the gate. Separate from `serve` so a test can stand
-/// it up on a port of its own.
-pub fn router(d: Shared) -> Router {
-    Router::new()
-        // The stack's one URL shape (goodlux, 2026-11-20):
-        // /{daemon}/{org}/{store}/..., org = squad, store = username. The
-        // path reads the way the store's addresses do. Calls that name no
-        // store sit directly under /ravel.
-        .route("/ravel/health", get(health))
-        .route("/ravel/stores", get(souls))
-        .route("/ravel/sync", post(sync_all))
-        .route("/ravel/shutdown", post(shutdown))
-        .route("/ravel/{org}/{store}/sparql", post(store_sparql))
-        .route("/ravel/{org}/{store}/query", post(soul_query))
-        .route("/ravel/{org}/{store}/sync", post(sync_one))
-        .route("/ravel/{org}/{store}/import", post(import_one))
-        .route("/ravel/{org}/{store}/memory", get(memory_view))
-        .route("/ravel/{org}/{store}/memory-progress", get(memory_progress))
-        .route("/ravel/{org}/{store}/memory-check", get(memory_check))
-        .route("/ravel/{org}/{store}/memory/{node}", get(memory_open))
-        .route("/ravel/{org}/{store}/health", get(soul_health))
-        .route("/ravel/{org}/{store}/stats", get(soul_stats))
-        .layer(axum::middleware::from_fn(listed_while_answered))
-        .layer(axum::middleware::from_fn_with_state(d.clone(), super::gate::check))
-        .with_state(d)
+fn json_ok(v: Value) -> Response {
+    Response::json(200, v)
+}
+
+/// Every route, behind the gate. Separate from `serve` so a test can
+/// stand it up on a port of its own.
+pub async fn dispatch(d: Shared, req: Request) -> Response {
+    // Every request is on the `doing` list from arrival to answer.
+    let _doing = super::doing::now(format!("{} {}", req.method, req.path));
+    if let Some(resp) = super::gate::check(&d, &req) {
+        return resp;
+    }
+    let seg: Vec<String> = req
+        .path
+        .trim_matches('/')
+        .split('/')
+        .map(pct_decode_path)
+        .collect();
+    let parts: Vec<&str> = seg.iter().map(|x| x.as_str()).collect();
+    // The stack's one URL shape (goodlux, 2026-11-20):
+    // /{daemon}/{org}/{store}/..., org = squad, store = username. The
+    // path reads the way the store's addresses do. Calls that name no
+    // store sit directly under /ravel.
+    let out: Result<Response, ApiError> = match (req.method.as_str(), parts.as_slice()) {
+        ("GET", ["ravel", "health"]) => health(&d).await.map(json_ok),
+        ("GET", ["ravel", "stores"]) => souls(&d).await.map(json_ok),
+        ("POST", ["ravel", "sync"]) => sync_all(&d).await.map(json_ok),
+        ("POST", ["ravel", "shutdown"]) => shutdown(&d).await.map(json_ok),
+        ("POST", ["ravel", org, store, "sparql"]) => store_sparql(&d, org, store, &req).await,
+        ("POST", ["ravel", org, store, "query"]) => soul_query(&d, org, store, &req).await.map(json_ok),
+        ("POST", ["ravel", org, store, "sync"]) => sync_one(&d, org, store, &req).await.map(json_ok),
+        ("POST", ["ravel", org, store, "import"]) => import_one(&d, org, store, &req).await.map(json_ok),
+        ("GET", ["ravel", org, store, "memory"]) => memory_view(&d, org, store, &req).await.map(json_ok),
+        ("GET", ["ravel", org, store, "memory-progress"]) => {
+            memory_progress(&d, org, store).await.map(json_ok)
+        }
+        ("GET", ["ravel", org, store, "memory-check"]) => memory_check(&d, org, store).await.map(json_ok),
+        ("GET", ["ravel", org, store, "memory", node]) => {
+            memory_open(&d, org, store, node).await.map(json_ok)
+        }
+        ("GET", ["ravel", org, store, "health"]) => soul_health(&d, org, store).await.map(json_ok),
+        ("GET", ["ravel", org, store, "stats"]) => soul_stats(&d, org, store).await.map(json_ok),
+        _ => Err(not_found(format!("no route for {} {}", req.method, req.path))),
+    };
+    match out {
+        Ok(r) => r,
+        Err(e) => Response::json(e.0, json!({ "error": e.1 })),
+    }
 }
 
 pub async fn serve(d: Shared) -> anyhow::Result<()> {
-    let app = router(d.clone());
     let addr = format!("127.0.0.1:{}", d.cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     super::log(format!("listening on http://{addr}"));
     tokio::spawn(name_every_other_signal());
     std::thread::spawn(watch_own_memory);
     let stop = d.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => super::log("interrupted; stopping"),
-                // `raveld stop` from a soul's session ends here: /shutdown is
-                // the machine owner's, the process signal is the OS user's.
-                _ = terminated() => super::log("SIGTERM; stopping"),
-                _ = stop.shutdown.notified() => super::log("asked to stop; stopping"),
-            }
-            stop.stopping
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        })
-        .await?;
+    let shutdown = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => super::log("interrupted; stopping"),
+            // `raveld stop` from a soul's session ends here: /shutdown is
+            // the machine owner's, the process signal is the OS user's.
+            _ = terminated() => super::log("SIGTERM; stopping"),
+            _ = stop.shutdown.notified() => super::log("asked to stop; stopping"),
+        }
+        stop.stopping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    };
+    let handler_state = d.clone();
+    phext_serve::http::serve_with_shutdown(
+        listener,
+        move |req| {
+            let dd = handler_state.clone();
+            async move { dispatch(dd, req).await }
+        },
+        shutdown,
+    )
+    .await;
     Ok(())
 }
 
@@ -114,8 +134,8 @@ fn identity_status(d: &Daemon) -> Value {
     })
 }
 
-async fn health(State(d): State<Shared>) -> Json<Value> {
-    Json(json!({
+async fn health(d: &Shared) -> Result<Value, ApiError> {
+    Ok(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "pid": std::process::id(),
@@ -135,7 +155,7 @@ async fn health(State(d): State<Shared>) -> Json<Value> {
     }))
 }
 
-async fn souls(State(d): State<Shared>) -> Json<Value> {
+async fn souls(d: &Shared) -> Result<Value, ApiError> {
     let rows: Vec<Value> = d
         .souls
         .iter()
@@ -175,10 +195,10 @@ async fn souls(State(d): State<Shared>) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!(rows))
+    Ok(json!(rows))
 }
 
-async fn sync_all(State(d): State<Shared>) -> Json<Value> {
+async fn sync_all(d: &Shared) -> Result<Value, ApiError> {
     let results = d.sync_all().await;
     let rows: Vec<Value> = results
         .into_iter()
@@ -187,7 +207,7 @@ async fn sync_all(State(d): State<Shared>) -> Json<Value> {
             Err(e) => json!({ "id": id, "ok": false, "error": format!("{e:#}") }),
         })
         .collect();
-    Json(json!(rows))
+    Ok(json!(rows))
 }
 
 #[derive(Deserialize, Default)]
@@ -198,13 +218,19 @@ struct SyncBody {
 }
 
 async fn sync_one(
-    State(d): State<Shared>,
-    Path((org, store)): Path<(String, String)>,
-    body: Option<Json<SyncBody>>,
-) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
+    d: &Shared,
+    org: &str,
+    store: &str,
+    req: &Request,
+) -> Result<Value, ApiError> {
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
+    let body: Option<SyncBody> = if req.body.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_slice(&req.body).map_err(bad)?)
+    };
     let src = body
-        .and_then(|Json(b)| b.sessions_dir)
+        .and_then(|b| b.sessions_dir)
         .map(std::path::PathBuf::from);
     if let Some(p) = &src {
         if !p.is_dir() {
@@ -215,9 +241,7 @@ async fn sync_one(
         }
     }
     let s = d.sync_one(&soul.id, src).await.map_err(internal)?;
-    Ok(Json(
-        json!({ "store": soul.name(), "path": soul.path.display().to_string(), "summary": s }),
-    ))
+    Ok(json!({ "store": soul.name(), "path": soul.path.display().to_string(), "summary": s }))
 }
 
 #[derive(serde::Deserialize)]
@@ -226,11 +250,13 @@ struct ImportBody {
 }
 
 async fn import_one(
-    State(d): State<Shared>,
-    Path((org, store)): Path<(String, String)>,
-    Json(b): Json<ImportBody>,
-) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
+    d: &Shared,
+    org: &str,
+    store: &str,
+    req: &Request,
+) -> Result<Value, ApiError> {
+    let b: ImportBody = serde_json::from_slice(&req.body).map_err(bad)?;
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
     let src = std::path::PathBuf::from(&b.path);
     if !src.is_dir() {
         return Err(bad(format!("{} is not a directory", src.display())));
@@ -240,28 +266,29 @@ async fn import_one(
         crate::sync::ImportOutcome::Copied { name, files, bytes } => ("copied", name, files, bytes),
         crate::sync::ImportOutcome::AlreadyImported { name } => ("already imported", name, 0, 0),
     };
-    Ok(Json(json!({
+    Ok(json!({
         "store": soul.name(),
         "status": status,
         "export": name,
         "files": files,
         "bytes": bytes,
         "summary": s,
-    })))
-}
-
-#[derive(Deserialize)]
-struct MemoryViewQuery {
-    lines: Option<usize>,
+    }))
 }
 
 async fn memory_view(
-    State(d): State<Shared>,
-    Path((org, store)): Path<(String, String)>,
-    Query(q): Query<MemoryViewQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
-    let lines = q.lines.unwrap_or(crate::memory::WAKE_LINES).max(1);
+    d: &Shared,
+    org: &str,
+    store: &str,
+    req: &Request,
+) -> Result<Value, ApiError> {
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
+    let params = req.query_params();
+    let lines = match params.get("lines") {
+        Some(v) => v.parse::<usize>().map_err(bad)?,
+        None => crate::memory::WAKE_LINES,
+    }
+    .max(1);
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let log = crate::memory_log::MemoryLog::for_soul(&soul.path);
         let ms = log.memories()?;
@@ -272,14 +299,17 @@ async fn memory_view(
     .await
     .map_err(internal)?
     .map_err(internal)?;
-    Ok(Json(v))
+    Ok(v)
 }
 
 async fn memory_open(
-    State(d): State<Shared>,
-    Path((org, store, node)): Path<(String, String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
+    d: &Shared,
+    org: &str,
+    store: &str,
+    node: &str,
+) -> Result<Value, ApiError> {
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
+    let node = node.to_string();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         use crate::memory_log::{zoom, MemoryLog};
         let log = MemoryLog::for_soul(&soul.path);
@@ -318,7 +348,7 @@ async fn memory_open(
     .await
     .map_err(internal)?
     .map_err(not_found)?;
-    Ok(Json(v))
+    Ok(v)
 }
 
 /// How far a soul's memory has got, for a UI's soul list: whether it is
@@ -326,10 +356,11 @@ async fn memory_open(
 /// distinct Turn nodes in the store; `turns_read` is turns the reader has
 /// read; `pending_blocks` are OptMem merges due and not written.
 async fn memory_progress(
-    State(d): State<Shared>,
-    Path((org, store)): Path<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
+    d: &Shared,
+    org: &str,
+    store: &str,
+) -> Result<Value, ApiError> {
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         use crate::memory_log::MemoryLog;
         let log = MemoryLog::for_soul(&soul.path);
@@ -354,14 +385,15 @@ async fn memory_progress(
     .await
     .map_err(internal)?
     .map_err(internal)?;
-    Ok(Json(v))
+    Ok(v)
 }
 
 async fn soul_health(
-    State(d): State<Shared>,
-    Path((org, store)): Path<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
+    d: &Shared,
+    org: &str,
+    store: &str,
+) -> Result<Value, ApiError> {
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
     let path = soul.path.clone();
     let findings = tokio::task::spawn_blocking(move || sync::diagnose(&path, None))
         .await
@@ -372,12 +404,12 @@ async fn soul_health(
         .iter()
         .map(|f| json!({ "attention": f.attention, "line": f.line }))
         .collect();
-    Ok(Json(json!({
+    Ok(json!({
         "store": soul.name(),
         "path": soul.path.display().to_string(),
         "attention": attention,
         "findings": rows,
-    })))
+    }))
 }
 
 /// A store open for reading, with its place at the store's turnstile
@@ -435,10 +467,11 @@ fn scalar(store: &Store, q: &str) -> anyhow::Result<String> {
 }
 
 async fn soul_stats(
-    State(d): State<Shared>,
-    Path((org, store)): Path<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
+    d: &Shared,
+    org: &str,
+    store: &str,
+) -> Result<Value, ApiError> {
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
     // One count at a time per store, and its answer stands for
     // STATS_STAND_FOR: every caller that arrives meanwhile waits for that one
     // count instead of starting its own. The count reads every statement
@@ -454,7 +487,7 @@ async fn soul_stats(
         if when.elapsed() < STATS_STAND_FOR {
             let mut v = v.clone();
             v["counted_secs_ago"] = json!(when.elapsed().as_secs());
-            return Ok(Json(v));
+            return Ok(v);
         }
     }
     let began = std::time::Instant::now();
@@ -512,7 +545,7 @@ async fn soul_stats(
     *kept = Some((std::time::Instant::now(), v.clone()));
     let mut v = v;
     v["counted_secs_ago"] = json!(0);
-    Ok(Json(v))
+    Ok(v)
 }
 
 /// How long one store's stats answer is given again before it is recounted.
@@ -558,15 +591,6 @@ async fn terminated() {
         }
         Err(_) => std::future::pending().await,
     }
-}
-
-/// Every request is on the `doing` list from arrival to answer.
-async fn listed_while_answered(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let _d = super::doing::now(format!("{} {}", req.method(), req.uri().path()));
-    next.run(req).await
 }
 
 /// Signals that would end the process without a word, caught and written to
@@ -866,7 +890,7 @@ async fn ask(
             one_line(&text)
         ));
         return Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
+            503,
             format!(
                 "{name} already has {QUERIES_AT_ONCE} queries running; ask again when one has finished. A query asked on a timer must take less time than its interval"
             ),
@@ -906,7 +930,7 @@ async fn ask(
             // keeps its place at the store until it has.
             stop.cancel();
             return Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
+                503,
                 format!(
                     "the query on {name} did not answer in {} seconds; narrow it (sort fewer rows, or filter before ORDER BY)",
                     QUERY_TIME_LIMIT.as_secs()
@@ -923,11 +947,13 @@ async fn ask(
 /// the query holds a name that was left as written and will likely match
 /// nothing; the answer itself cannot say so.
 async fn soul_query(
-    State(d): State<Shared>,
-    Path((org, store)): Path<(String, String)>,
-    Json(body): Json<QueryBody>,
-) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
+    d: &Shared,
+    org: &str,
+    store: &str,
+    req: &Request,
+) -> Result<Value, ApiError> {
+    let body: QueryBody = serde_json::from_slice(&req.body).map_err(bad)?;
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
     let (a, notes) = ask(soul, body.query).await?;
     let mut v = match a {
         Answer::Results(v) => v,
@@ -936,7 +962,7 @@ async fn soul_query(
     if !notes.is_empty() {
         v["notes"] = json!(notes);
     }
-    Ok(Json(v))
+    Ok(v)
 }
 
 /// The W3C SPARQL protocol route, the same shape gitlexd and pand answer
@@ -946,15 +972,15 @@ async fn soul_query(
 /// `application/sparql-results+json`; CONSTRUCT answers
 /// `application/n-triples`.
 async fn store_sparql(
-    State(d): State<Shared>,
-    Path((org, store)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
-    body: String,
+    d: &Shared,
+    org: &str,
+    store: &str,
+    req: &Request,
 ) -> Result<Response, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
-    let kind = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
+    let body = String::from_utf8(req.body.clone()).map_err(bad)?;
+    let kind = req
+        .header("content-type")
         .unwrap_or("")
         .split(';')
         .next()
@@ -966,7 +992,7 @@ async fn store_sparql(
         "application/json" => serde_json::from_str::<QueryBody>(&body).map_err(bad)?.query,
         other => {
             return Err(ApiError(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                415,
                 format!(
                     "Content-Type {other:?} is not read here; send the query as                      application/sparql-query, or {{\"query\": ...}} as application/json"
                 ),
@@ -985,14 +1011,15 @@ async fn store_sparql(
             ("application/n-triples", s)
         }
     };
-    let mut resp = (StatusCode::OK, out).into_response();
-    let h = resp.headers_mut();
-    h.insert(axum::http::header::CONTENT_TYPE, ctype.parse().unwrap());
+    let mut resp = Response {
+        status: 200,
+        content_type: ctype.into(),
+        extra: Vec::new(),
+        body: out.into_bytes(),
+    };
     // A standard body has no room for a note, so it rides a header.
     if !notes.is_empty() {
-        if let Ok(v) = notes.join(" | ").parse() {
-            h.insert("x-ravel-notes", v);
-        }
+        resp.extra.push(("x-ravel-notes".into(), notes.join(" | ")));
     }
     Ok(resp)
 }
@@ -1001,10 +1028,11 @@ async fn store_sparql(
 /// own records — every line passes the checks, every block due is built,
 /// every note cites real turns, the wake is OptMem's cover.
 async fn memory_check(
-    State(d): State<Shared>,
-    Path((org, store)): Path<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
+    d: &Shared,
+    org: &str,
+    store: &str,
+) -> Result<Value, ApiError> {
+    let soul = d.soul_named(org, store).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let log = crate::memory_log::MemoryLog::for_soul(&soul.path);
         let v = crate::memory_relive::verify(&soul.path, &log)?;
@@ -1013,12 +1041,19 @@ async fn memory_check(
     .await
     .map_err(internal)?
     .map_err(internal)?;
-    Ok(Json(v))
+    Ok(v)
 }
 
-async fn shutdown(State(d): State<Shared>) -> Json<Value> {
-    d.shutdown.notify_one();
-    Json(json!({ "ok": true, "stopping": true }))
+async fn shutdown(d: &Shared) -> Result<Value, ApiError> {
+    // The stop signal is delayed a beat so this answer is on the wire
+    // before `serve` returns (axum's graceful shutdown used to cover
+    // this; the shared HTTP layer does not drain).
+    let stop = d.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        stop.shutdown.notify_one();
+    });
+    Ok(json!({ "ok": true, "stopping": true }))
 }
 
 #[cfg(test)]
@@ -1045,37 +1080,73 @@ mod tests {
         d.keys = crate::tessera::HostKeys::new(dir.join("jwks.json"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router(Arc::new(d))).await.unwrap() });
+        let shared = Arc::new(d);
+        tokio::spawn(async move {
+            phext_serve::http::serve(listener, move |req| {
+                let dd = shared.clone();
+                async move { dispatch(dd, req).await }
+            })
+            .await
+        });
         format!("http://{addr}")
     }
 
-    async fn status(req: reqwest::RequestBuilder) -> (u16, bool) {
-        let r = req.send().await.unwrap();
-        (r.status().as_u16(), r.headers().contains_key("www-authenticate"))
+    /// One raw HTTP round trip on a fresh connection: the returned
+    /// status, whether a `www-authenticate` header rode along, and the
+    /// body. (This was reqwest's job before reqwest left the tree.)
+    async fn raw(
+        base: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, bool, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let addr = base.strip_prefix("http://").unwrap();
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status: u16 = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let www = text.to_lowercase().contains("www-authenticate:");
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, www, body)
     }
 
     #[tokio::test]
     async fn the_gate_stands_in_front_of_every_route() {
         let base = stand_up().await;
-        let c = reqwest::Client::new();
         // Open to anyone on the machine.
-        assert_eq!(status(c.get(format!("{base}/ravel/health"))).await.0, 200);
-        assert_eq!(status(c.get(format!("{base}/ravel/stores"))).await.0, 200);
+        assert_eq!(raw(&base, "GET", "/ravel/health", &[]).await.0, 200);
+        assert_eq!(raw(&base, "GET", "/ravel/stores", &[]).await.0, 200);
         // No token: stopping raveld and writing are refused, and say how to ask.
-        assert_eq!(status(c.post(format!("{base}/ravel/shutdown"))).await, (401, true));
-        assert_eq!(status(c.post(format!("{base}/ravel/sync"))).await, (401, true));
-        assert_eq!(status(c.post(format!("{base}/ravel/7r1pl3f0rc3/nobody/sync"))).await, (401, true));
+        let shut = raw(&base, "POST", "/ravel/shutdown", &[]).await;
+        assert_eq!((shut.0, shut.1), (401, true));
+        assert_eq!(raw(&base, "POST", "/ravel/sync", &[]).await.0, 401);
+        assert_eq!(raw(&base, "POST", "/ravel/sync", &[]).await.1, true);
+        assert_eq!(raw(&base, "POST", "/ravel/7r1pl3f0rc3/nobody/sync", &[]).await.0, 401);
+        assert_eq!(raw(&base, "POST", "/ravel/7r1pl3f0rc3/nobody/sync", &[]).await.1, true);
         // No token on a read passes the gate for now; no such soul, so 404.
-        assert_eq!(status(c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))).await.0, 404);
+        assert_eq!(raw(&base, "GET", "/ravel/7r1pl3f0rc3/nobody/stats", &[]).await.0, 404);
         // A token that is sent and is not good is refused, reads included.
-        let bad = c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats")).bearer_auth("abc.def.ghi");
-        assert_eq!(status(bad).await, (401, true));
-        let basic = c
-            .get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))
-            .header("authorization", "Basic abc");
-        assert_eq!(status(basic).await.0, 401);
+        let bad = raw(&base, "GET", "/ravel/7r1pl3f0rc3/nobody/stats", &[("Authorization", "Bearer abc.def.ghi")]).await;
+        assert_eq!((bad.0, bad.1), (401, true));
+        assert_eq!(
+            raw(&base, "GET", "/ravel/7r1pl3f0rc3/nobody/stats", &[("Authorization", "Basic abc")]).await.0,
+            401
+        );
         // /health still answers after all of that: nothing was stopped.
-        let h: Value = c.get(format!("{base}/ravel/health")).send().await.unwrap().json().await.unwrap();
+        let (_, _, body) = raw(&base, "GET", "/ravel/health", &[]).await;
+        let h: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(h["identity"]["reads_need_a_token"], false);
         assert_eq!(h["identity"]["squaddies_with_a_key"], 0);
     }
