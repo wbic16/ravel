@@ -93,3 +93,30 @@ Full SPARQL beyond the subset, blank nodes, and empty-string literals are not ch
 - Ravel harness on the phext backend: **72/72** checks ok. Wavelets: **19/19**.
 - 12-query differential battery vs the recorded phext-transport digests: **12/12 byte-identical** (the Oxigraph reference oracle is gone by design; the comparison is against the recorded phext digests in `~/ravel-min-work/digests-before/` on the hub).
 - Ashfall (report mode, policy as of this run — the audit leg's expanded phext, 61 pass audits): root 198 → **134** violations, transitive 239 → 185, duplicates 9 → 5, and every oxigraph-family finding gone; phext-serve 12 → **2** (the holo-phext git source, twice). The root tree still FAILs ashfall on pre-existing, non-graph findings — the unaudited axum/reqwest/tokio stacks, the tessera stop above, the new phext-serve path dep's own missing audit scroll, and the 60-package budget at 185 — which are the audit leg's and the coordinator's to close, not this rewrite's.
+
+## 2026-11-27 — ashfall convergence (leg D): the tree passes ashfall clean
+
+Will's direction, continued: a **clean ashfall pass over the whole tree**. Every remaining finding from the leg-C entry above is closed here. Ashfall final (policy 63 PASS audits, audits.phext CURRENT, sha256 5ea51413): **ravel PASS (direct 8, transitive 37 of budget 60, 0 violations); phext-serve PASS (direct 4, transitive 27, 0 violations)**. Root lock: 187 → 40 packages. Stage commits: `03ee5a9` (holo-phext vendoring), `1e7e78c` (tessera port), `78cbeb1` (axum), `7359de3` (reqwest), `bec48d5` (chrono), `548f33a` (serde_yaml), plus the serde alignment and this entry.
+
+### Tessera — ported in-tree (was: git dependency, 36 packages)
+
+The git dep is gone. Tessera 0.1.1 @ `1142eb66066624ebfa405b7679b3731e72b8fc4f` (repolex) is **ported file-for-file** into `src/tessera/` (mod/verify/access/keyring) — this is a port of repolex's tessera gate surface, credited here as PATCHES.md requires; the code is theirs, the port is ours. One substitution: tessera's Ed25519 verification (ed25519-dalek) is replaced by an in-tree verifier, `src/ed25519.rs`, because dalek's derive chain forces a second `syn` major version, which ashfall's no-duplicates rule forbids. The verifier implements dalek's `verify_strict` semantics exactly (canonical-s check, small-order rejection for both key and R, RFC 8032 decompression incl. the x=0/sign-bit refusal) and was differentially verified against dalek itself before the swap: 200 valid signatures accepted, 2,432 mutation/torsion cases, **0 disagreements**. All gate tests pass unchanged. Not constant-time — named in the module header: every input it checks is public (keys, signatures, messages), no secret is ever an input.
+
+### Axum — out; one HTTP stack
+
+raveld's HTTP surface re-seats on phext-serve's bare-tokio HTTP machinery, factored into the library as `phext_serve::http` (the phext-serve binary's own copy is deleted in favour of it). Routes are an explicit dispatch table in `src/daemon/http.rs`; the gate middleware is a plain function (`daemon::gate::check`). Named divergences: unmatched routes answer a JSON `{"error": …}` 404 instead of axum's empty 404; `POST /ravel/shutdown` delays its stop signal 250 ms so the answer lands before the server returns (axum's graceful drain used to cover that).
+
+### Reqwest — out (ladder rung b)
+
+Call sites, logged before the cut: `src/client.rs` (blocking, plain HTTP to raveld on 127.0.0.1), `src/writer.rs` `AnthropicApi` (the tree's only HTTPS call: POST api.anthropic.com, behind the macOS keychain, on the hand-run reword-api path), daemon HTTP tests (now a raw tokio client). Rung (a) was measured and refused on duplicates, not count: rustls+ring drags `windows-sys` 0.52 beside tokio's 0.61; native-tls drags a second `syn` and `tempfile` — a crate with an ashfall verdict of FAIL — via rustix. So: plain HTTP is implemented in-tree (`src/http_client.rs`; no redirects followed — raveld never redirects), and the Anthropic call runs through a Python-stdlib (urllib+ssl) helper embedded in `src/writer.rs`, the API key travelling only inside the request JSON on the helper's stdin. The daemon contract is unchanged; the harness stays 72/72.
+
+### Chrono, serde_yaml — replaced in-tree; anyhow — audited
+
+- Chrono's used surface (RFC 3339 parse/format, local time, durations) is re-implemented in `src/time.rs` (local time via libc `localtime_r`); its ~28-package platform tree is gone.
+- serde_yaml is replaced by a ~150-line reader in `src/daemon/config.rs` for config.yml's actual grammar. unsafe-libyaml beneath serde_yaml is a C transliteration; it was not passed on a thin examination — the honest move was the small reader, which refuses shapes outside the config grammar rather than guessing.
+- anyhow stays, now with a genuine PASS audit scroll (zero dependencies; unsafe confined to its type-erasure core, named in the scroll). phext-serve likewise gained its first-party PASS scroll.
+- Duplicates, all resolved: cpufeatures, getrandom, rand_core (left with the reqwest/quinn and tessera/dalek chains), windows-sys 0.52 (left with ring), syn 2.0.118 (root serde aligned to phext-serve's 1.0.229, whose derive uses syn 3).
+
+### holo-phext — vendored
+
+holo-phext is definitively not on crates.io (API + sparse index checked 2026-11-27). It is vendored byte-for-byte at `phext/serve/vendor/holo-phext/` (upstream wbic16/holo-phext rev `bafed5f36ebfad92f1011fe5c2bd8bdd3c3a9511`, 0.2.5, MIT, PROVENANCE.md in place) and path-depended from phext-serve. (The coordinator's brief named `phext/vendor/holo-phext/`; ashfall flags a path dep escaping phext-serve's project tree as unvendorable, so the vendor copy lives inside the serve project — deviation recorded here and in REWRITE-LOG.) No exceptions.toml entry was needed.

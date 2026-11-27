@@ -25,7 +25,6 @@ use super::registry::Soul;
 use super::Daemon;
 use phext_serve::http::{Request, Response};
 use serde_json::json;
-use std::sync::Arc;
 use crate::tessera::{Caller, Owner};
 
 /// Phase 5 turns this on, in every daemon at once.
