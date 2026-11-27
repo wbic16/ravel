@@ -45,5 +45,8 @@ serde_yaml = "0.9"
 # rewrite the calamus crate used to perform is applied as Prep data
 # derived from the shipped ontologies, calamus's own closure ported —
 # the same port the phext backend runs (ontology_prep()).
-# Who is asking, and whether they may: the stack's shared crate (tr1pl3x's).
-tessera = { git = "https://github.com/repolex-ai/tessera", rev = "1142eb66066624ebfa405b7679b3731e72b8fc4f" }
+# Who is asking, and whether they may: tessera's gate surface, ported
+# in-tree as src/tessera (upstream repolex-ai/tessera @ 1142eb6) with
+# Ed25519 verification served by src/ed25519 — see PATCHES.md. base64
+# is the port's one crates.io helper (already in the tree, PASS).
+base64 = "0.22"

@@ -18,13 +18,13 @@
 //! Reads open the store read-only; only the sync pass writes.
 
 use super::Daemon;
-use crate::graph::{CancellationToken, QueryResults, Store, Term};
 use crate::{graph, sync};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use crate::graph::{CancellationToken, QueryResults, Store, Term};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -74,10 +74,7 @@ pub fn router(d: Shared) -> Router {
         .route("/ravel/{org}/{store}/health", get(soul_health))
         .route("/ravel/{org}/{store}/stats", get(soul_stats))
         .layer(axum::middleware::from_fn(listed_while_answered))
-        .layer(axum::middleware::from_fn_with_state(
-            d.clone(),
-            super::gate::check,
-        ))
+        .layer(axum::middleware::from_fn_with_state(d.clone(), super::gate::check))
         .with_state(d)
 }
 
@@ -461,9 +458,7 @@ async fn soul_stats(
         }
     }
     let began = std::time::Instant::now();
-    let shown = soul
-        .address()
-        .unwrap_or_else(|| soul.path.display().to_string());
+    let shown = soul.address().unwrap_or_else(|| soul.path.display().to_string());
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let store = open_store(&soul)?;
         let g = "GRAPH ?g { ?s ?p ?o }";
@@ -525,8 +520,8 @@ const STATS_STAND_FOR: std::time::Duration = std::time::Duration::from_secs(300)
 
 type StatsSlot = Arc<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>>;
 
-fn stats_kept(
-) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StatsSlot>> {
+fn stats_kept() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StatsSlot>>
+{
     static S: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StatsSlot>>,
     > = std::sync::OnceLock::new();
@@ -631,7 +626,8 @@ fn answer(
     // ends at 2.04 s. What spareval does on a cancel is turn each row still
     // to come into an error, so a cancelled query can still cost a moment;
     // raveld's own memory watch stands behind it.
-    let (results, report) = crate::outside::run_until(&store, text, names.root(), Some(stop))?;
+    let (results, report) =
+        crate::outside::run_until(&store, text, names.root(), Some(stop))?;
     let notes = crate::outside::notes(&report);
     let a = match results {
         QueryResults::Solutions(sols) => {
@@ -787,9 +783,7 @@ fn watch_own_memory() {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
         let Some(held) = memory_held() else { continue };
-        if held >= MEMORY_IS_NOTED
-            && noted.is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 30)
-        {
+        if held >= MEMORY_IS_NOTED && noted.is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 30) {
             noted = Some(std::time::Instant::now());
             super::log(format!(
                 "memory note: {:.1} GB held; under way:\n  {}",
@@ -859,7 +853,10 @@ fn one_line(text: &str) -> String {
 
 /// An outside query, with a place at the store, a time limit, and a line in
 /// the log when it was slow, stopped or abandoned.
-async fn ask(soul: super::registry::Soul, text: String) -> Result<(Answer, Vec<String>), ApiError> {
+async fn ask(
+    soul: super::registry::Soul,
+    text: String,
+) -> Result<(Answer, Vec<String>), ApiError> {
     let name = soul
         .address()
         .unwrap_or_else(|| soul.path.display().to_string());
@@ -1045,7 +1042,7 @@ mod tests {
             warnings: vec![],
         };
         let mut d = Daemon::open(cfg).unwrap();
-        d.keys = tessera::HostKeys::new(dir.join("jwks.json"));
+        d.keys = crate::tessera::HostKeys::new(dir.join("jwks.json"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router(Arc::new(d))).await.unwrap() });
@@ -1054,10 +1051,7 @@ mod tests {
 
     async fn status(req: reqwest::RequestBuilder) -> (u16, bool) {
         let r = req.send().await.unwrap();
-        (
-            r.status().as_u16(),
-            r.headers().contains_key("www-authenticate"),
-        )
+        (r.status().as_u16(), r.headers().contains_key("www-authenticate"))
     }
 
     #[tokio::test]
@@ -1068,43 +1062,20 @@ mod tests {
         assert_eq!(status(c.get(format!("{base}/ravel/health"))).await.0, 200);
         assert_eq!(status(c.get(format!("{base}/ravel/stores"))).await.0, 200);
         // No token: stopping raveld and writing are refused, and say how to ask.
-        assert_eq!(
-            status(c.post(format!("{base}/ravel/shutdown"))).await,
-            (401, true)
-        );
-        assert_eq!(
-            status(c.post(format!("{base}/ravel/sync"))).await,
-            (401, true)
-        );
-        assert_eq!(
-            status(c.post(format!("{base}/ravel/7r1pl3f0rc3/nobody/sync"))).await,
-            (401, true)
-        );
+        assert_eq!(status(c.post(format!("{base}/ravel/shutdown"))).await, (401, true));
+        assert_eq!(status(c.post(format!("{base}/ravel/sync"))).await, (401, true));
+        assert_eq!(status(c.post(format!("{base}/ravel/7r1pl3f0rc3/nobody/sync"))).await, (401, true));
         // No token on a read passes the gate for now; no such soul, so 404.
-        assert_eq!(
-            status(c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats")))
-                .await
-                .0,
-            404
-        );
+        assert_eq!(status(c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))).await.0, 404);
         // A token that is sent and is not good is refused, reads included.
-        let bad = c
-            .get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))
-            .bearer_auth("abc.def.ghi");
+        let bad = c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats")).bearer_auth("abc.def.ghi");
         assert_eq!(status(bad).await, (401, true));
         let basic = c
             .get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))
             .header("authorization", "Basic abc");
         assert_eq!(status(basic).await.0, 401);
         // /health still answers after all of that: nothing was stopped.
-        let h: Value = c
-            .get(format!("{base}/ravel/health"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let h: Value = c.get(format!("{base}/ravel/health")).send().await.unwrap().json().await.unwrap();
         assert_eq!(h["identity"]["reads_need_a_token"], false);
         assert_eq!(h["identity"]["squaddies_with_a_key"], 0);
     }

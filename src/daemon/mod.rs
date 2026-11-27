@@ -117,7 +117,7 @@ pub struct Daemon {
     memory_dirty: Mutex<std::collections::HashSet<String>>,
     /// The machine's key list, grants and owner (`~/.lex/identity/`), read
     /// through tessera. Checked on every request by `gate`.
-    pub keys: tessera::HostKeys,
+    pub keys: crate::tessera::HostKeys,
 }
 
 /// Where git-lex keeps this machine's identity records.
@@ -156,7 +156,7 @@ impl Daemon {
             stopping: std::sync::atomic::AtomicBool::new(false),
             memory: Mutex::new(memory::MemoryState::default()),
             memory_dirty: Mutex::new(dirty),
-            keys: tessera::HostKeys::new(identity_dir().join("jwks.json")),
+            keys: crate::tessera::HostKeys::new(identity_dir().join("jwks.json")),
         })
     }
 

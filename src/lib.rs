@@ -17,6 +17,7 @@ pub mod annotate;
 pub mod claude_ai;
 pub mod client;
 pub mod daemon;
+pub mod ed25519;
 pub mod graph;
 pub mod herdr;
 pub mod memory;
@@ -31,6 +32,7 @@ pub mod readdress;
 pub mod reader;
 pub mod soul;
 pub mod sync;
+pub mod tessera;
 pub mod ttl;
 pub mod writer;
 
