@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod ed25519;
 pub mod graph;
 pub mod herdr;
+pub mod http_client;
 pub mod memory;
 pub mod memory_extract;
 pub mod memory_log;

@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 pub struct Client {
     base: String,
-    http: reqwest::blocking::Client,
+    /// How long a call may take: a full pass over a large soul can take
+    /// a while; the CLI waits.
+    timeout: Duration,
     /// This session's token, when the folder `ravel` was run in is a bound
     /// soul. Sent on every call, so raveld knows who is asking.
     token: Option<String>,
@@ -45,11 +47,7 @@ impl Client {
     pub fn new(cfg: &DaemonConfig) -> Self {
         Self {
             base: cfg.base_url(),
-            http: reqwest::blocking::Client::builder()
-                // A full pass over a large soul can take a while; the CLI waits.
-                .timeout(Duration::from_secs(600))
-                .build()
-                .expect("http client"),
+            timeout: Duration::from_secs(600),
             token: session_token(),
         }
     }
@@ -57,45 +55,65 @@ impl Client {
     /// `/ravel/health`, or the reason it did not answer. Short timeout: this is the
     /// question "is anyone there".
     pub fn health(&self) -> Result<Value> {
-        let quick = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()?;
-        let r = quick.get(format!("{}/ravel/health", self.base)).send()?;
-        Ok(r.error_for_status()?.json()?)
+        let r = crate::http_client::request(
+            "GET",
+            &format!("{}/ravel/health", self.base),
+            &self.headers(None),
+            None,
+            Duration::from_secs(2),
+        )?;
+        if !r.is_success() {
+            return Err(anyhow!("{}", r.status_text()));
+        }
+        r.json()
+            .ok_or_else(|| anyhow!("raveld's health answer is not JSON"))
     }
 
-    fn finish(r: reqwest::blocking::Response) -> Result<Value> {
-        let status = r.status();
+    fn finish(r: crate::http_client::Response) -> Result<Value> {
         let v: Value = r.json().unwrap_or(Value::Null);
-        if status.is_success() {
+        if r.is_success() {
             Ok(v)
         } else {
+            let fallback = r.status_text();
             Err(anyhow!(
                 "{}",
-                v["error"].as_str().unwrap_or(status.as_str())
+                v["error"].as_str().unwrap_or(&fallback)
             ))
         }
     }
 
+    fn headers(&self, content_type: Option<&str>) -> Vec<(String, String)> {
+        let mut h = Vec::new();
+        if let Some(t) = &self.token {
+            h.push(("Authorization".to_string(), format!("Bearer {t}")));
+        }
+        if let Some(ct) = content_type {
+            h.push(("Content-Type".to_string(), ct.to_string()));
+        }
+        h
+    }
+
     pub fn get(&self, path: &str) -> Result<Value> {
-        let req = self.http.get(format!("{}{path}", self.base));
-        Self::finish(self.auth(req).send()?)
+        let r = crate::http_client::request(
+            "GET",
+            &format!("{}{path}", self.base),
+            &self.headers(None),
+            None,
+            self.timeout,
+        )?;
+        Self::finish(r)
     }
 
     pub fn post(&self, path: &str, body: Option<Value>) -> Result<Value> {
-        let req = self.http.post(format!("{}{path}", self.base));
-        let req = match body {
-            Some(b) => req.json(&b),
-            None => req,
-        };
-        Self::finish(self.auth(req).send()?)
-    }
-
-    fn auth(&self, req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
-        match &self.token {
-            Some(t) => req.bearer_auth(t),
-            None => req,
-        }
+        let bytes = body.as_ref().map(|b| b.to_string().into_bytes());
+        let r = crate::http_client::request(
+            "POST",
+            &format!("{}{path}", self.base),
+            &self.headers(body.is_some().then_some("application/json")),
+            bytes.as_deref(),
+            self.timeout,
+        )?;
+        Self::finish(r)
     }
 }
 
