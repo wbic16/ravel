@@ -43,7 +43,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 # No HTTP-client crate: ravel talks to raveld over plain HTTP via
 # src/http_client (in-tree), and the one HTTPS call (Anthropic) runs
 # through a Python-stdlib helper in src/writer — see PATCHES.md.
-serde_yaml = "0.9"
+# No YAML crate: config.yml's small grammar is read in-tree in
+# src/daemon/config.rs — see PATCHES.md.
 # Outside queries are prepared in-tree (src/outside.rs): the ontology
 # rewrite the calamus crate used to perform is applied as Prep data
 # derived from the shipped ontologies, calamus's own closure ported —

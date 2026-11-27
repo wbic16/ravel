@@ -19,7 +19,6 @@
 //! must never be the same silent state.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 /// Ruled 2026-09-22 (goodlux): 7881 for now.
@@ -29,23 +28,221 @@ pub const DEFAULT_PORT: u16 = 7881;
 /// it has seen), so this can be short.
 pub const DEFAULT_INTERVAL_SECS: u64 = 30;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+/// The parsed config file, before defaults and meaning are applied.
+#[derive(Debug, Clone, Default)]
 struct Raw {
     port: Option<u16>,
     interval_secs: Option<u64>,
-    #[serde(default)]
     souls: Vec<String>,
     human: Option<String>,
     memory: Option<RawMemory>,
     /// Retired 2026-11-05 with the API path. Read only to say so.
-    memory_budget_usd: Option<serde_yaml::Value>,
+    memory_budget_usd: Option<Yaml>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 struct RawMemory {
     writer: Option<String>,
     model: Option<String>,
-    reword: Option<serde_yaml::Value>,
+    reword: Option<Yaml>,
+}
+
+/// The slice of YAML this file is written in — nothing more.
+///
+/// serde_yaml (and the C transliteration under it, unsafe-libyaml)
+/// left the tree in leg D (2026-11-27): the config's whole grammar is
+/// top-level `key: value` lines, one nested map (`memory:`), string
+/// lists (block or `[flow]`), comments, and plain scalars, and
+/// auditing a C-derived parser line-by-line was not an honest pass.
+/// This reader covers exactly those shapes and refuses the rest
+/// (anchors, multi-line strings, flow maps) rather than guessing.
+/// Matched against serde_yaml where they overlap: `true`/`false` are
+/// booleans, `on`/`off` are strings, unknown keys are ignored, a key
+/// with no value and no block under it is null.
+#[derive(Debug, Clone, PartialEq)]
+enum Yaml {
+    Null,
+    Bool(bool),
+    Str(String),
+    Seq(Vec<Yaml>),
+    Map(Vec<(String, Yaml)>),
+}
+
+impl Yaml {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Yaml::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn get(&self, key: &str) -> Option<&Yaml> {
+        match self {
+            Yaml::Map(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+}
+
+fn strip_comment(line: &str) -> &str {
+    let (mut sq, mut dq) = (false, false);
+    let b = line.as_bytes();
+    for i in 0..b.len() {
+        match b[i] {
+            b'\'' if !dq => sq = !sq,
+            b'"' if !sq => dq = !dq,
+            b'#' if !sq && !dq && (i == 0 || b[i - 1] == b' ' || b[i - 1] == b'\t') => {
+                return line[..i].trim_end();
+            }
+            _ => {}
+        }
+    }
+    line.trim_end()
+}
+
+fn yaml_lines(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .map(|l| {
+            let clean = strip_comment(l);
+            let indent = clean.len() - clean.trim_start().len();
+            (indent, clean.trim().to_string())
+        })
+        .filter(|(_, c)| !c.is_empty())
+        .collect()
+}
+
+fn parse_scalar(s: &str) -> Yaml {
+    let s = s.trim();
+    if s.is_empty() {
+        return Yaml::Null;
+    }
+    if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return Yaml::Seq(vec![]);
+        }
+        return Yaml::Seq(inner.split(',').map(parse_scalar).collect());
+    }
+    if let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        return Yaml::Str(inner.replace("\\\"", "\"").replace("\\\\", "\\"));
+    }
+    if let Some(inner) = s.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+        return Yaml::Str(inner.replace("''", "'"));
+    }
+    match s {
+        "true" => Yaml::Bool(true),
+        "false" => Yaml::Bool(false),
+        "~" | "null" => Yaml::Null,
+        _ => Yaml::Str(s.to_string()),
+    }
+}
+
+/// Parse one block (map or sequence) at `indent`, from `lines[pos..]`;
+/// returns the value and the first unconsumed line index.
+fn parse_block(lines: &[(usize, String)], pos: usize, indent: usize) -> (Yaml, usize) {
+    let mut pos = pos;
+    if lines.get(pos).is_some_and(|(_, c)| c == "-" || c.starts_with("- ")) {
+        let mut items = Vec::new();
+        while let Some((ind, content)) = lines.get(pos) {
+            if *ind != indent || !(content == "-" || content.starts_with("- ")) {
+                break;
+            }
+            let item = content.strip_prefix('-').unwrap_or("").trim();
+            items.push(parse_scalar(item));
+            pos += 1;
+        }
+        return (Yaml::Seq(items), pos);
+    }
+    let mut pairs = Vec::new();
+    while let Some((ind, content)) = lines.get(pos) {
+        if *ind != indent {
+            break;
+        }
+        let Some(colon) = content
+            .char_indices()
+            .find(|(_, c)| *c == ':')
+            .map(|(i, _)| i)
+            .filter(|i| {
+                let rest = &content[*i + 1..];
+                rest.is_empty() || rest.starts_with(' ')
+            })
+        else {
+            break;
+        };
+        let key = parse_scalar(&content[..colon]);
+        let Yaml::Str(key) = key else { break };
+        let rest = content[colon + 1..].trim();
+        pos += 1;
+        if !rest.is_empty() {
+            pairs.push((key, parse_scalar(rest)));
+            continue;
+        }
+        // No inline value: a deeper block, a sequence at this same
+        // indent (YAML allows that under a key), or null.
+        match lines.get(pos) {
+            Some((nind, _)) if *nind > indent => {
+                let (v, np) = parse_block(lines, pos, *nind);
+                pairs.push((key, v));
+                pos = np;
+            }
+            Some((nind, c)) if *nind == indent && (c == "-" || c.starts_with("- ")) => {
+                let (v, np) = parse_block(lines, pos, indent);
+                pairs.push((key, v));
+                pos = np;
+            }
+            _ => pairs.push((key, Yaml::Null)),
+        }
+    }
+    (Yaml::Map(pairs), pos)
+}
+
+fn parse_config_yaml(text: &str) -> Result<Raw> {
+    let lines = yaml_lines(text);
+    if lines.is_empty() {
+        return Ok(Raw::default());
+    }
+    let (doc, used) = parse_block(&lines, 0, lines[0].0);
+    anyhow::ensure!(
+        used == lines.len(),
+        "config lines past {} are outside the shapes read here",
+        used + 1
+    );
+    let num = |key: &str| -> Result<Option<u64>> {
+        match doc.get(key) {
+            None | Some(Yaml::Null) => Ok(None),
+            Some(Yaml::Str(v)) => v
+                .trim()
+                .parse::<u64>()
+                .map(Some)
+                .with_context(|| format!("{key} is a number, not {v:?}")),
+            Some(other) => anyhow::bail!("{key} is a number, not {other:?}"),
+        }
+    };
+    let strings = |v: Option<&Yaml>| -> Vec<String> {
+        match v {
+            Some(Yaml::Seq(items)) => {
+                items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect()
+            }
+            Some(Yaml::Str(one)) => vec![one.clone()],
+            _ => vec![],
+        }
+    };
+    let memory = match doc.get("memory") {
+        None | Some(Yaml::Null) => None,
+        Some(m @ Yaml::Map(_)) => Some(RawMemory {
+            writer: m.get("writer").and_then(Yaml::as_str).map(str::to_string),
+            model: m.get("model").and_then(Yaml::as_str).map(str::to_string),
+            reword: m.get("reword").cloned(),
+        }),
+        Some(other) => anyhow::bail!("memory: is a map of writer/model/reword, not {other:?}"),
+    };
+    Ok(Raw {
+        port: num("port")?.map(|n| n as u16),
+        interval_secs: num("interval_secs")?,
+        souls: strings(doc.get("souls")),
+        human: doc.get("human").and_then(Yaml::as_str).map(str::to_string),
+        memory,
+        memory_budget_usd: doc.get("memory_budget_usd").cloned(),
+    })
 }
 
 /// Which souls have their merges rewritten into the current wording.
@@ -165,7 +362,7 @@ impl DaemonConfig {
         let (raw, present) = match std::fs::read_to_string(path) {
             Ok(s) if s.trim().is_empty() => (Raw::default(), true),
             Ok(s) => (
-                serde_yaml::from_str::<Raw>(&s)
+                parse_config_yaml(&s)
                     .with_context(|| format!("parse {}", path.display()))?,
                 true,
             ),
@@ -185,16 +382,16 @@ impl DaemonConfig {
                     .unwrap_or_else(|| harness.default_model().to_string());
                 let reword = match raw.memory.as_ref().and_then(|m| m.reword.clone()) {
                     None => Reword::Off,
-                    Some(serde_yaml::Value::Bool(b)) => {
+                    Some(Yaml::Bool(b)) => {
                         if b {
                             Reword::All
                         } else {
                             Reword::Off
                         }
                     }
-                    Some(serde_yaml::Value::String(s)) if s == "on" || s == "all" => Reword::All,
-                    Some(serde_yaml::Value::String(s)) if s == "off" => Reword::Off,
-                    Some(serde_yaml::Value::Sequence(v)) => Reword::Souls(
+                    Some(Yaml::Str(s)) if s == "on" || s == "all" => Reword::All,
+                    Some(Yaml::Str(s)) if s == "off" => Reword::Off,
+                    Some(Yaml::Seq(v)) => Reword::Souls(
                         v.iter()
                             .filter_map(|x| x.as_str().map(str::to_string))
                             .collect(),
