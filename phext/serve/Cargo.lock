@@ -27,7 +27,6 @@ dependencies = [
 [[package]]
 name = "holo-phext"
 version = "0.2.5"
-source = "git+https://github.com/wbic16/holo-phext?rev=bafed5f36ebfad92f1011fe5c2bd8bdd3c3a9511#bafed5f36ebfad92f1011fe5c2bd8bdd3c3a9511"
 dependencies = [
  "libphext",
  "memmap2",

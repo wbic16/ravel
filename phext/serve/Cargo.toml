@@ -11,8 +11,10 @@ repository = "https://github.com/wbic16/ravel"
 # ONE libphext so Coordinate is one type (same pin phext-lattice used).
 libphext = { version = "0.6.6", features = ["binary"] }
 # HoloPhext: phext-lattice's transaction layer; the store engine
-# phext-serve hosts. Same rev phext-lattice exo pins.
-holo-phext = { git = "https://github.com/wbic16/holo-phext", rev = "bafed5f36ebfad92f1011fe5c2bd8bdd3c3a9511" }
+# phext-serve hosts. Vendored in-tree at vendor/holo-phext (upstream
+# wbic16/holo-phext rev bafed5f, 0.2.5 — not on crates.io; see its
+# PROVENANCE.md). Byte-for-byte upstream; divergences go in PATCHES.md.
+holo-phext = { path = "vendor/holo-phext" }
 # /txn and /quads speak JSON. In phext-lattice this arrived via the
 # web feature; here it is a direct dependency, named.
 serde_json = "1"
