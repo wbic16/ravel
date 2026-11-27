@@ -46,13 +46,8 @@ impl Memory {
 
 /// The local calendar day of an RFC 3339 time, `YYYY-MM-DD`.
 pub fn local_date(ts: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|t| {
-            t.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d")
-                .to_string()
-        })
-        .unwrap_or_else(|_| ts.get(..10).unwrap_or(ts).to_string())
+    crate::time::parse_local_format(ts, "%Y-%m-%d")
+        .unwrap_or_else(|| ts.get(..10).unwrap_or(ts).to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -110,7 +105,7 @@ impl MemoryLog {
     /// whether a soul is fully read.
     pub fn write_stream_size(&self, turns: usize) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        let v = serde_json::json!({ "turns": turns, "counted": chrono::Utc::now().to_rfc3339() });
+        let v = serde_json::json!({ "turns": turns, "counted": crate::time::now_rfc3339() });
         let tmp = self.path("stream.json.tmp");
         std::fs::write(&tmp, v.to_string())?;
         std::fs::rename(&tmp, self.path("stream.json"))?;
@@ -174,7 +169,7 @@ impl MemoryLog {
             writeln!(
                 f,
                 "{}\t{}",
-                chrono::Utc::now().to_rfc3339(),
+                crate::time::now_rfc3339(),
                 l.replace(['\n', '\t'], " ")
             )?;
         }
@@ -191,7 +186,7 @@ impl MemoryLog {
         writeln!(
             f,
             "{}\t{soul}\t{input}\t{output}\t0",
-            chrono::Utc::now().to_rfc3339()
+            crate::time::now_rfc3339()
         )?;
         Ok(())
     }
@@ -533,10 +528,7 @@ pub fn project_into(
     let memories = log.memories()?;
     let summaries = log.summaries()?;
     // The graph was called `memory-v1` until 0.10.0; that one goes for good.
-    drop_graph(
-        store,
-        &NamedNode::new(names.graph(crate::names::OLD_MEMORY_GRAPH))?,
-    )?;
+    drop_graph(store, &NamedNode::new(names.graph(crate::names::OLD_MEMORY_GRAPH))?)?;
     let g = NamedNode::new(names.memory_graph())?;
     drop_graph(store, &g)?;
     if memories.is_empty() {
@@ -614,11 +606,7 @@ mod tests {
         let two = super::projection_stamp(&repo, &bare).unwrap();
         assert_ne!(two, one, "a log that grew");
         let named = crate::names::Names::new("squad", "someone").unwrap();
-        assert_ne!(
-            super::projection_stamp(&repo, &named).unwrap(),
-            two,
-            "other addresses"
-        );
+        assert_ne!(super::projection_stamp(&repo, &named).unwrap(), two, "other addresses");
         std::fs::remove_dir_all(&repo).ok();
     }
 
@@ -724,7 +712,9 @@ mod tests {
         assert!(nt.contains(&format!("{} {rel} {} .", m("0-3"), m("0-1"))));
         assert!(nt.contains(&format!("{} {rel} {} .", m("0-3"), m("2-3"))));
         let store = crate::graph::Store::new().unwrap();
-        store.load_nt(&nt, None).unwrap();
+        store
+            .load_nt(&nt, None)
+            .unwrap();
     }
 
     /// ravel.ttl stands on the Subtexture base and on nothing of git-lex's:
@@ -735,7 +725,9 @@ mod tests {
         let ravel = include_str!("../ontology/ravel/ravel.ttl");
         let base = include_str!("../ontology/subtexture/subtexture.ttl");
         let store = crate::graph::Store::new().unwrap();
-        store.load_ttl(base, None).expect("subtexture.ttl parses");
+        store
+            .load_ttl(base, None)
+            .expect("subtexture.ttl parses");
         let code: String = ravel
             .lines()
             .filter(|l| !l.trim_start().starts_with('#'))
@@ -782,7 +774,9 @@ mod tests {
     fn the_ontology_declares_every_memory_term_the_projection_emits() {
         let ttl = include_str!("../ontology/ravel/ravel.ttl");
         let store = crate::graph::Store::new().unwrap();
-        store.load_ttl(ttl, None).expect("ravel.ttl parses");
+        store
+            .load_ttl(ttl, None)
+            .expect("ravel.ttl parses");
         let ms: Vec<Memory> = (0..2).map(mem).collect();
         let mut s = HashMap::new();
         s.insert("0-1".to_string(), sum((0, 2), "x"));

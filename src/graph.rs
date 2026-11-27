@@ -44,8 +44,8 @@ use crate::reader::Annotation;
 use crate::{Event, RAVEL_NS};
 use anyhow::{Context, Result};
 use phext_serve::sparql::{
-    evaluate_with_stop_view, parse_query, Literal as PLiteral, Prep, QuadSource, Results,
-    Term as PTerm, Triple as PTriple, VecSource,
+    evaluate_with_stop_view, parse_query, Literal as PLiteral, Prep, Results, Term as PTerm,
+    QuadSource, Triple as PTriple, VecSource,
 };
 use std::path::{Path, PathBuf};
 
@@ -223,12 +223,12 @@ pub struct Triple {
 }
 
 impl Triple {
-    pub fn new(subject: NamedOrBlankNode, predicate: NamedNode, object: Term) -> Self {
-        Self {
-            subject,
-            predicate,
-            object,
-        }
+    pub fn new(
+        subject: NamedOrBlankNode,
+        predicate: NamedNode,
+        object: Term,
+    ) -> Self {
+        Self { subject, predicate, object }
     }
 }
 
@@ -291,12 +291,7 @@ impl Quad {
         object: Term,
         graph_name: GraphName,
     ) -> Self {
-        Self {
-            subject,
-            predicate,
-            object,
-            graph_name,
-        }
+        Self { subject, predicate, object, graph_name }
     }
 }
 
@@ -304,11 +299,7 @@ impl std::fmt::Display for Quad {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.graph_name {
             GraphName::NamedNode(g) => {
-                write!(
-                    f,
-                    "{} {} {} {}",
-                    self.subject, self.predicate, self.object, g
-                )
+                write!(f, "{} {} {} {}", self.subject, self.predicate, self.object, g)
             }
             GraphName::DefaultGraph => {
                 write!(f, "{} {} {}", self.subject, self.predicate, self.object)
@@ -360,7 +351,9 @@ pub fn from_pterm(t: &PTerm) -> Term {
 fn subject_pterm(s: &NamedOrBlankNode) -> PTerm {
     match s {
         NamedOrBlankNode::NamedNode(n) => PTerm::Iri(n.as_str().to_string()),
-        NamedOrBlankNode::BlankNode(b) => PTerm::Iri(format!("_:blank-node-refused-{b}")),
+        NamedOrBlankNode::BlankNode(b) => {
+            PTerm::Iri(format!("_:blank-node-refused-{b}"))
+        }
     }
 }
 
@@ -453,8 +446,7 @@ impl CancellationToken {
         Self::default()
     }
     pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
@@ -483,10 +475,7 @@ pub struct Store {
 
 impl Store {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            src: std::sync::RwLock::new(VecSource::new()),
-            file: None,
-        })
+        Ok(Self { src: std::sync::RwLock::new(VecSource::new()), file: None })
     }
 
     /// Open (or create) the persistent store at directory `path`.
@@ -515,21 +504,17 @@ impl Store {
         } else {
             VecSource::new()
         };
-        Ok(Self {
-            src: std::sync::RwLock::new(src),
-            file: Some(file),
-        })
+        Ok(Self { src: std::sync::RwLock::new(src), file: Some(file) })
     }
 
     /// Write the store back to its file, whole and atomically (a temp
     /// file renamed over the old one). A no-op for an in-memory store.
     pub fn flush(&self) -> Result<()> {
-        let Some(file) = &self.file else {
-            return Ok(());
-        };
+        let Some(file) = &self.file else { return Ok(()) };
         let text = self.src.read().unwrap().to_nquads();
         let tmp = file.with_extension("nq.tmp");
-        std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::write(&tmp, text)
+            .with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, file)
             .with_context(|| format!("put the store at {}", file.display()))?;
         Ok(())
@@ -570,7 +555,8 @@ impl Store {
             TermRef::BlankNode(b) => PTerm::Iri(format!("_:blank-node-refused-{b}")),
             TermRef::Triple(t) => to_pterm(&Term::Triple(Box::new((*t).clone()))),
         });
-        let graph: Option<Option<String>> = g.map(|g| g.selector().map(str::to_string));
+        let graph: Option<Option<String>> =
+            g.map(|g| g.selector().map(str::to_string));
         let quads = self.src.read().unwrap().quads_for_pattern(
             s_t.as_ref(),
             p_t.as_ref(),
@@ -616,15 +602,9 @@ impl Store {
             };
             let o = match o {
                 crate::ttl::TtlTerm::Iri(i) => PTerm::Iri(i),
-                crate::ttl::TtlTerm::Literal {
-                    value,
-                    datatype,
-                    lang,
-                } => PTerm::Literal(PLiteral {
-                    value,
-                    datatype,
-                    lang,
-                }),
+                crate::ttl::TtlTerm::Literal { value, datatype, lang } => {
+                    PTerm::Literal(PLiteral { value, datatype, lang })
+                }
             };
             src.insert(phext_serve::sparql::Quad {
                 graph: graph.map(str::to_string),
@@ -664,11 +644,7 @@ impl Store {
     }
 
     pub fn contains_named_graph(&self, graph: &NamedNode) -> Result<bool> {
-        Ok(self
-            .src
-            .read()
-            .unwrap()
-            .contains_named_graph(graph.as_str()))
+        Ok(self.src.read().unwrap().contains_named_graph(graph.as_str()))
     }
 
     /// Evaluate a SPARQL query (the phext subset) over this store.
@@ -719,7 +695,8 @@ impl Store {
         stop: Option<&CancellationToken>,
         union: bool,
     ) -> Result<QueryResults> {
-        let query = parse_query(text, base).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+        let query = parse_query(text, base)
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
         let src = self.src.read().unwrap();
         let outcome = evaluate_with_stop_view(
             &query,
@@ -750,9 +727,9 @@ impl Store {
                         Ok(Triple {
                             subject: match from_pterm(&t.s) {
                                 Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
-                                other => NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(
-                                    other.value(),
-                                )),
+                                other => NamedOrBlankNode::NamedNode(
+                                    NamedNode::new_unchecked(other.value()),
+                                ),
                             },
                             predicate: match from_pterm(&t.p) {
                                 Term::NamedNode(n) => n,
@@ -974,6 +951,7 @@ pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
         .with_context(|| format!("open read-only phext store at {}", path.as_ref().display()))
 }
 
+
 /// Ingest one transcript's Turn nodes AND its annotations into its named
 /// graph, idempotently. Clears the transcript's named graph first (so a
 /// dropped key doesn't ghost), then loads the freshly-projected
@@ -1008,12 +986,7 @@ pub fn ingest_annotations(
     store.flush()?;
 
     Ok(store
-        .quads_for_pattern(
-            None,
-            None,
-            None,
-            Some(GraphNameRef::NamedNode(graph.as_ref())),
-        )
+        .quads_for_pattern(None, None, None, Some(GraphNameRef::NamedNode(graph.as_ref())))
         .count())
 }
 
@@ -1042,12 +1015,7 @@ pub fn ingest_transcript(
     store.flush()?;
 
     Ok(store
-        .quads_for_pattern(
-            None,
-            None,
-            None,
-            Some(GraphNameRef::NamedNode(graph.as_ref())),
-        )
+        .quads_for_pattern(None, None, None, Some(GraphNameRef::NamedNode(graph.as_ref())))
         .count())
 }
 
@@ -1063,11 +1031,7 @@ pub fn append_transcript(
 ) -> Result<()> {
     let graph_iri = transcript_graph_iri(names, transcript_id);
     let graph = NamedNode::new(&graph_iri).context("transcript graph IRI")?;
-    let mut nt = project_nt(
-        events,
-        &names.turn_partition(),
-        &crate::project::Who::of(names),
-    )?;
+    let mut nt = project_nt(events, &names.turn_partition(), &crate::project::Who::of(names))?;
     nt.push_str(&annotation_nt(anns, transcript_id, names)?);
     store.load_nt(&nt, Some(&graph_iri))?;
     describe_graph(store, names, &graph, GraphKind::Transcript)?;
@@ -1084,9 +1048,7 @@ const RDFS_MEMBER: &str = "http://www.w3.org/2000/01/rdf-schema#member";
 /// A turn's time as a number, for telling newer from older whatever zone
 /// or precision it was written in. A time that cannot be read sorts oldest.
 fn instant(ts: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|t| t.timestamp_millis())
-        .unwrap_or(i64::MIN)
+    crate::time::unix_millis(ts).unwrap_or(i64::MIN)
 }
 
 /// Keep `{root}ravel/NamedGraph/recent` listing the store's newest
@@ -1362,21 +1324,18 @@ mod tests {
         // Every turn is still stored once: asked of all graphs together
         // (a query with no GRAPH sees the union of every graph — the
         // phext evaluator's dataset rule).
-        let QueryResults::Solutions(rows) = eval_query_union(
-            &store,
-            &format!("SELECT ?t WHERE {{ ?t a <{RAVEL_NS}Turn> }}"),
-        )
-        .unwrap() else {
+        let QueryResults::Solutions(rows) =
+            eval_query_union(&store, &format!("SELECT ?t WHERE {{ ?t a <{RAVEL_NS}Turn> }}")).unwrap()
+        else {
             panic!()
         };
         assert_eq!(rows.count(), 700);
         // It is described as a plain named graph, private, with its owner.
-        let said: Vec<String> =
-            query_rows(&store, &format!("SELECT ?o WHERE {{ <{recent}> ?p ?o }}"))
-                .unwrap()
-                .into_iter()
-                .map(|r| r["o"].clone())
-                .collect();
+        let said: Vec<String> = query_rows(&store, &format!("SELECT ?o WHERE {{ <{recent}> ?p ?o }}"))
+            .unwrap()
+            .into_iter()
+            .map(|r| r["o"].clone())
+            .collect();
         assert!(said.contains(&format!("{RAVEL_NS}NamedGraph")), "{said:?}");
         assert!(said.contains(&"private".to_string()));
         assert!(said.iter().any(|o| o.ends_with("/soul/Soul/spacegoat")));
@@ -1416,10 +1375,8 @@ mod tests {
         assert_eq!(anns.len(), 1);
 
         // ingest twice — idempotent: triple count stable, no duplication.
-        let n1 = ingest_annotations(&store, &evs, &anns, "sess-A", &crate::names::Names::bare())
-            .unwrap();
-        let n2 = ingest_annotations(&store, &evs, &anns, "sess-A", &crate::names::Names::bare())
-            .unwrap();
+        let n1 = ingest_annotations(&store, &evs, &anns, "sess-A", &crate::names::Names::bare()).unwrap();
+        let n2 = ingest_annotations(&store, &evs, &anns, "sess-A", &crate::names::Names::bare()).unwrap();
         assert!(n1 > 0);
         assert_eq!(n1, n2, "re-ingest must not change the graph (idempotent)");
 
@@ -1495,14 +1452,7 @@ mod tests {
         let anns = emojikey_read(&evs);
         assert_eq!(anns.len(), 1, "only the middle turn has an emojikey");
 
-        ingest_transcript(
-            &store,
-            &evs,
-            &anns,
-            "sess-full",
-            &crate::names::Names::bare(),
-        )
-        .unwrap();
+        ingest_transcript(&store, &evs, &anns, "sess-full", &crate::names::Names::bare()).unwrap();
 
         // ALL THREE turns are present as spine nodes (not just the annotated one).
         let count_q = format!(
@@ -1537,10 +1487,7 @@ mod tests {
         }
         let n = |q: &str| query_rows(&store, q).unwrap()[0]["n"].clone();
         // 2,600 transcripts and the list of the newest turns.
-        assert_eq!(
-            n("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"),
-            "2601"
-        );
+        assert_eq!(n("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"), "2601");
         assert_eq!(n("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { ?g <https://repolex.ai/ontology/ravel/visibility> ?v }"), "2601");
         assert_eq!(store.named_graphs().count(), 2601);
         drop(store);
@@ -1569,26 +1516,12 @@ mod tests {
         assert!(objects.contains(&"private"));
         assert!(objects.contains(&"https://repolex.ai/7r1pl3f0rc3/spacegoat/soul/Soul/spacegoat"));
         // The turn is under the soul's own root.
-        let t = query_rows(
-            &store,
-            "SELECT ?t WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }",
-        )
-        .unwrap();
-        assert_eq!(
-            t[0]["t"],
-            "https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/Turn/only"
-        );
+        let t = query_rows(&store, "SELECT ?t WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }").unwrap();
+        assert_eq!(t[0]["t"], "https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/Turn/only");
 
         drop_graph(&store, &NamedNode::new(g).unwrap()).unwrap();
-        assert!(
-            said(&store).is_empty(),
-            "a dropped graph is no longer announced"
-        );
-        let left = query_rows(
-            &store,
-            &format!("SELECT ?s WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}"),
-        )
-        .unwrap();
+        assert!(said(&store).is_empty(), "a dropped graph is no longer announced");
+        let left = query_rows(&store, &format!("SELECT ?s WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}")).unwrap();
         assert!(left.is_empty());
     }
 }

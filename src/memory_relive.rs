@@ -100,13 +100,8 @@ fn note_prompt(
 }
 
 fn local_time(ts: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|t| {
-            t.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M %:z")
-                .to_string()
-        })
-        .unwrap_or_else(|_| ts.to_string())
+    crate::time::parse_local_format(ts, "%Y-%m-%d %H:%M %:z")
+        .unwrap_or_else(|| ts.to_string())
 }
 
 /// One model call, tried up to four times with a growing pause: a rate limit
@@ -509,7 +504,7 @@ fn merge(
         block: memory::block_id(b),
         text,
         model: llm.model().to_string(),
-        written: chrono::Utc::now().to_rfc3339(),
+        written: crate::time::now_rfc3339(),
         // A rebuild with extra words is a trial, not the current wording.
         wording: Some(
             if extra.is_some() {
@@ -755,7 +750,7 @@ pub fn reword_parallel(
                         block: memory::block_id(b),
                         text,
                         model: llm.model().to_string(),
-                        written: chrono::Utc::now().to_rfc3339(),
+                        written: crate::time::now_rfc3339(),
                         wording: Some(memory_log::WORDING.to_string()),
                     };
                     log.append_summary(&sm)?;
@@ -771,8 +766,7 @@ pub fn reword_parallel(
                     ));
                 }
                 Err(e) => {
-                    r.stopped
-                        .get_or_insert(format!("merge #{}: {e:#}", memory::block_id(b)));
+                    r.stopped.get_or_insert(format!("merge #{}: {e:#}", memory::block_id(b)));
                 }
             }
         }
@@ -878,11 +872,7 @@ pub fn load_unread(
     let since = unread
         .iter()
         .flat_map(|n| {
-            let first = if n.from_start {
-                first_input(&n.conv)
-            } else {
-                None
-            };
+            let first = if n.from_start { first_input(&n.conv) } else { None };
             n.conv
                 .turns
                 .iter()
@@ -1284,10 +1274,7 @@ mod tests {
     fn real_unread_is_the_same_read_whole_or_from_its_place() {
         let repo = std::path::PathBuf::from(std::env::var("RAVEL_TRIAL_REPO").unwrap());
         let dir = std::path::PathBuf::from(std::env::var("RAVEL_TRIAL_DIR").unwrap());
-        assert!(
-            !dir.starts_with(&repo),
-            "the trial folder must be outside the soul"
-        );
+        assert!(!dir.starts_with(&repo), "the trial folder must be outside the soul");
         let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
         let souls: Vec<(std::path::PathBuf, String)> = std::env::var("RAVEL_TRIAL_SOULS")
             .unwrap()
@@ -1296,11 +1283,7 @@ mod tests {
             .collect();
         let sp = Speakers {
             agent: name(&repo),
-            peers: souls
-                .iter()
-                .map(|s| s.1.clone())
-                .filter(|n| *n != name(&repo))
-                .collect(),
+            peers: souls.iter().map(|s| s.1.clone()).filter(|n| *n != name(&repo)).collect(),
             human: "human".into(),
         };
         let mut done = MemoryLog::for_soul(&repo).extracted().unwrap();

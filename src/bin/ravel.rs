@@ -226,14 +226,11 @@ fn soul_name(client: &Client, id: &str) -> String {
         .get("/ravel/stores")
         .ok()
         .and_then(|v| {
-            v.as_array()?
-                .iter()
-                .find(|s| address(s).as_deref() == Some(id))
-                .and_then(|s| {
-                    std::path::Path::new(s["path"].as_str()?)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                })
+            v.as_array()?.iter().find(|s| address(s).as_deref() == Some(id)).and_then(|s| {
+                std::path::Path::new(s["path"].as_str()?)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
         })
         .unwrap_or_else(|| id.to_string())
 }
@@ -347,13 +344,8 @@ fn souls(client: &Client) -> Result<()> {
 /// Memories are stored in UTC; shown in UTC, a late-evening event lands on
 /// the next day (4m41th34's "conscious on 08-04" was 08-03 local).
 fn short(ts: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|t| {
-            t.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|_| ts.get(..16).unwrap_or(ts).replace('T', " "))
+    ravel::time::parse_local_format(ts, "%Y-%m-%d %H:%M")
+        .unwrap_or_else(|| ts.get(..16).unwrap_or(ts).replace('T', " "))
 }
 
 /// Wake lines as OptMem prints them: `#i date text` and `#lo-hi text`.

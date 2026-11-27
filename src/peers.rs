@@ -40,9 +40,7 @@ pub fn flat(t: &str) -> String {
 }
 
 pub(crate) fn unix(ts: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .ok()
-        .map(|t| t.timestamp())
+    crate::time::unix(ts)
 }
 
 /// The file a command sends with `$(cat <file>)`, if it does.

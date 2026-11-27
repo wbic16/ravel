@@ -46,34 +46,16 @@ pub fn prep() -> &'static Prep {
     PREP.get_or_init(|| {
         use crate::ttl::{triples, TtlTerm};
         let mut prefixes = std::collections::HashMap::from([
-            (
-                "owl".to_string(),
-                "http://www.w3.org/2002/07/owl#".to_string(),
-            ),
-            (
-                "rdfs".to_string(),
-                "http://www.w3.org/2000/01/rdf-schema#".to_string(),
-            ),
+            ("owl".to_string(), "http://www.w3.org/2002/07/owl#".to_string()),
+            ("rdfs".to_string(), "http://www.w3.org/2000/01/rdf-schema#".to_string()),
         ]);
         // (predicate, is_property, both_ways)
         let edge_kinds: std::collections::HashMap<&str, (bool, bool)> =
             std::collections::HashMap::from([
-                (
-                    "http://www.w3.org/2000/01/rdf-schema#subPropertyOf",
-                    (true, false),
-                ),
-                (
-                    "http://www.w3.org/2002/07/owl#equivalentProperty",
-                    (true, true),
-                ),
-                (
-                    "http://www.w3.org/2000/01/rdf-schema#subClassOf",
-                    (false, false),
-                ),
-                (
-                    "http://www.w3.org/2002/07/owl#equivalentClass",
-                    (false, true),
-                ),
+                ("http://www.w3.org/2000/01/rdf-schema#subPropertyOf", (true, false)),
+                ("http://www.w3.org/2002/07/owl#equivalentProperty", (true, true)),
+                ("http://www.w3.org/2000/01/rdf-schema#subClassOf", (false, false)),
+                ("http://www.w3.org/2002/07/owl#equivalentClass", (false, true)),
             ]);
         let mut prop_edges: std::collections::HashMap<String, std::collections::HashSet<String>> =
             Default::default();
@@ -87,11 +69,7 @@ pub fn prep() -> &'static Prep {
                 let Some(&(is_prop, both_ways)) = edge_kinds.get(p.as_str()) else {
                     continue;
                 };
-                let edges = if is_prop {
-                    &mut prop_edges
-                } else {
-                    &mut class_edges
-                };
+                let edges = if is_prop { &mut prop_edges } else { &mut class_edges };
                 edges.entry(o.clone()).or_default().insert(s.clone());
                 edges.entry(s.clone()).or_default();
                 if both_ways {
@@ -156,12 +134,7 @@ pub fn prepare(text: &str, base: &str) -> Result<(Query, Report)> {
     let query = parse_query(text, base).map_err(|e| anyhow!("{}", e.message))?;
     let mut left = Vec::new();
     collect_left(&query, prep(), &mut left);
-    Ok((
-        query,
-        Report {
-            left_as_written: left,
-        },
-    ))
+    Ok((query, Report { left_as_written: left }))
 }
 
 /// Prepare and run. The results borrow nothing from the query.
@@ -233,9 +206,7 @@ mod tests {
         assert!(dir.contains("scratchpad"), "a scratch copy only");
         let q = std::fs::read_to_string(std::env::var("RAVEL_TRIAL_QUERY").unwrap()).unwrap();
         let base = std::env::var("RAVEL_TRIAL_BASE").unwrap();
-        let secs: u64 = std::env::var("RAVEL_TRIAL_SECS")
-            .map(|s| s.parse().unwrap())
-            .unwrap_or(60);
+        let secs: u64 = std::env::var("RAVEL_TRIAL_SECS").map(|s| s.parse().unwrap()).unwrap_or(60);
         let done = Arc::new(AtomicBool::new(false));
         let writer = {
             let (dir, base, done) = (dir.clone(), base.clone(), done.clone());
@@ -248,8 +219,7 @@ mod tests {
                         .then(|| crate::graph::writing(std::path::Path::new(&dir)));
                     let store = crate::graph::open(std::path::Path::new(&dir)).unwrap();
                     let g = format!("{base}ravel/NamedGraph/trial");
-                    let ts =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let ts = crate::time::Instant::now().to_rfc3339_millis_z();
                     let nt = format!(
                         "<{base}ravel/Turn/trial-{n}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://repolex.ai/ontology/ravel/Turn> .\n\
                          <{base}ravel/Turn/trial-{n}> <https://repolex.ai/ontology/ravel/timestamp> \"{ts}\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n\
@@ -279,10 +249,7 @@ mod tests {
                         let rows = sols.filter(|s| s.is_ok()).count();
                         let took = t.elapsed().as_secs_f64();
                         if took > 3.0 {
-                            eprintln!(
-                                "SLOW: {took:.1}s, {rows} rows, at {:.0}s",
-                                t0.elapsed().as_secs_f64()
-                            );
+                            eprintln!("SLOW: {took:.1}s, {rows} rows, at {:.0}s", t0.elapsed().as_secs_f64());
                         }
                         worst = worst.max(took);
                     }
@@ -301,9 +268,7 @@ mod tests {
         }
         done.store(true, Ordering::Relaxed);
         let written = writer.join().unwrap();
-        eprintln!(
-            "DONE: {runs} queries, worst {worst:.2}s, {failed} failed, {written} turns written"
-        );
+        eprintln!("DONE: {runs} queries, worst {worst:.2}s, {failed} failed, {written} turns written");
     }
 
     /// One query against a real store, read-only, timed. `RAVEL_TRIAL_STORE`
@@ -339,10 +304,7 @@ mod tests {
                 }
             }
         }
-        eprintln!(
-            "ROWS {n}, ERRORS {errs} in {:.2}s",
-            t.elapsed().as_secs_f64()
-        );
+        eprintln!("ROWS {n}, ERRORS {errs} in {:.2}s", t.elapsed().as_secs_f64());
     }
 
     /// On a copy of a real soul (`RAVEL_TRIAL_REPO`, in a scratchpad): list
@@ -352,10 +314,7 @@ mod tests {
     #[ignore]
     fn real_recent() {
         let repo = std::path::PathBuf::from(std::env::var("RAVEL_TRIAL_REPO").unwrap());
-        assert!(
-            repo.to_string_lossy().contains("scratchpad"),
-            "a copy, never a soul"
-        );
+        assert!(repo.to_string_lossy().contains("scratchpad"), "a copy, never a soul");
         let names = crate::names::Names::for_soul(&repo).unwrap();
         let store = crate::graph::open(repo.join(crate::sync::STORE_SUBDIR)).unwrap();
         for i in 1..=2 {
@@ -378,18 +337,12 @@ mod tests {
                     n += 1;
                 }
             }
-            eprintln!(
-                "{what}: {n} rows, newest {first}, in {:.3}s",
-                t.elapsed().as_secs_f64()
-            );
+            eprintln!("{what}: {n} rows, newest {first}, in {:.3}s", t.elapsed().as_secs_f64());
         };
         let p = "PREFIX ravel: <https://repolex.ai/ontology/ravel/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>";
         let rest = "?t ravel:timestamp ?ts ; ravel:role ?role . OPTIONAL { ?t ravel:text ?text } } ORDER BY DESC(?ts) LIMIT 40";
         ask("OF THE LIST", &format!("{p} SELECT ?t ?ts ?role ?text WHERE {{ GRAPH <ravel/NamedGraph/recent> {{ ?l rdfs:member ?t }} {rest}"));
-        ask(
-            "OF THE WHOLE STORE",
-            &format!("{p} SELECT ?t ?ts ?role ?text WHERE {{ ?t a ravel:Turn . {rest}"),
-        );
+        ask("OF THE WHOLE STORE", &format!("{p} SELECT ?t ?ts ?role ?text WHERE {{ ?t a ravel:Turn . {rest}"));
         ask("OF THE LIST again", &format!("{p} SELECT ?t ?ts ?role ?text WHERE {{ GRAPH <ravel/NamedGraph/recent> {{ ?l rdfs:member ?t }} {rest}"));
     }
 
@@ -420,10 +373,7 @@ mod tests {
     #[test]
     fn a_query_with_no_graph_sees_every_graph() {
         let s = store();
-        assert_eq!(
-            count(&s, &format!("{P} SELECT ?t WHERE {{ ?t a ravel:Turn }}")),
-            2
-        );
+        assert_eq!(count(&s, &format!("{P} SELECT ?t WHERE {{ ?t a ravel:Turn }}")), 2);
     }
 
     #[test]
@@ -445,8 +395,7 @@ mod tests {
         let s = store();
         let q = format!("{P} SELECT ?r WHERE {{ <ravel/Turn/t1> ravel:role ?r }}");
         assert_eq!(count(&s, &q), 1);
-        let q =
-            format!("{P} SELECT ?t WHERE {{ GRAPH <ravel/NamedGraph/b> {{ ?t a ravel:Turn }} }}");
+        let q = format!("{P} SELECT ?t WHERE {{ GRAPH <ravel/NamedGraph/b> {{ ?t a ravel:Turn }} }}");
         assert_eq!(count(&s, &q), 1);
     }
 
@@ -468,10 +417,7 @@ mod tests {
         };
         let rows: Vec<_> = sols.map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 3);
-        assert!(
-            rows.iter().all(|r| r.get("g").is_some()),
-            "a row lost its graph"
-        );
+        assert!(rows.iter().all(|r| r.get("g").is_some()), "a row lost its graph");
     }
 
     #[test]

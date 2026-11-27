@@ -31,7 +31,8 @@ path = "src/bin/ravel.rs"
 phext-serve = { path = "phext/serve" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-chrono = "0.4"
+# No date/time crate: the used surface (RFC 3339 parse/format,
+# local time, durations) lives in src/time — see PATCHES.md.
 anyhow = "1"
 # Deterministic annotation IRIs (idempotent reimport — the w4r3z discipline).
 sha2 = "0.10"
