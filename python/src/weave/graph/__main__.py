@@ -45,7 +45,7 @@ def _cmd_nt(transcript: str) -> int:
 
 
 def _cmd_query(transcript: str, sparql: str | None) -> int:
-    from .store import load_monolog, query  # lazy: needs the graph extra
+    from .store import load_monolog, query  # lazy: needs the phext-sparql binary
     store = load_monolog(transcript)
     q = sparql or _DEMO_SPARQL
     rows = list(query(store, q))

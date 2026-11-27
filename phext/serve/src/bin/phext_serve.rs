@@ -24,9 +24,9 @@ use std::sync::Arc;
 
 use holo_phext::{HoloPhext, Txn};
 use libphext::phext::Coordinate;
+use phext_serve::http::{self, Request, Response};
 use phext_serve::sparql::{evaluate, parse_query, Prep, Results, VecSource};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 const RING_CAP: usize = 4096;
@@ -145,45 +145,6 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn pct_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'%' if i + 2 < b.len() => {
-                let h = (b[i + 1] as char).to_digit(16);
-                let l = (b[i + 2] as char).to_digit(16);
-                if let (Some(h), Some(l)) = (h, l) {
-                    out.push((h * 16 + l) as u8);
-                    i += 3;
-                } else {
-                    out.push(b[i]);
-                    i += 1;
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn parse_query_str(qs: &str) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    for pair in qs.split('&').filter(|p| !p.is_empty()) {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        m.insert(pct_decode(k), pct_decode(v));
-    }
-    m
-}
-
 fn parse_coord(s: &str) -> Result<Coordinate, String> {
     Coordinate::try_from(s).map_err(|e| format!("bad coordinate {s:?}: {e}"))
 }
@@ -257,57 +218,30 @@ fn run_query(src: &VecSource, rq: &str, base: &str, prep_text: Option<&str>) -> 
 
 // ── HTTP ─────────────────────────────────────────────────────────────
 
-struct Response {
-    status: u16,
-    content_type: String,
-    extra: Vec<(String, String)>,
-    body: Vec<u8>,
+fn err_response(msg: impl Into<String>) -> Response {
+    Response::text(400, format!("ERROR\t{}\n", msg.into()))
 }
 
-impl Response {
-    fn text(status: u16, body: impl Into<String>) -> Response {
-        Response {
-            status,
-            content_type: "text/plain; charset=utf-8".into(),
-            extra: Vec::new(),
-            body: body.into().into_bytes(),
-        }
-    }
-    fn json(status: u16, v: serde_json::Value) -> Response {
-        Response {
-            status,
-            content_type: "application/json".into(),
-            extra: Vec::new(),
-            body: v.to_string().into_bytes(),
-        }
-    }
-    fn err(msg: impl Into<String>) -> Response {
-        Response::text(400, format!("ERROR\t{}\n", msg.into()))
-    }
-}
-
-async fn route(
-    state: &State,
-    method: &str,
-    path: &str,
-    params: &HashMap<String, String>,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-) -> Response {
+async fn route(state: &State, req: &Request) -> Response {
+    let method = req.method.as_str();
+    let path = req.path.as_str();
+    let params = &req.query_params();
+    let headers = &req.headers;
+    let body: &[u8] = &req.body;
     let stem = match params.get("p") {
         Some(p) => p.clone(),
-        None => return Response::err("missing p=<stem>"),
+        None => return err_response("missing p=<stem>"),
     };
     let soul = match state.soul(&stem).await {
         Ok(s) => s,
-        Err(e) => return Response::err(e),
+        Err(e) => return err_response(e),
     };
     let body_str = String::from_utf8_lossy(body).into_owned();
     match (method, path) {
         ("GET", "/api/v2/select") => {
             let coord = match params.get("c").ok_or_else(|| "missing c".to_string()).and_then(|c| parse_coord(c)) {
                 Ok(c) => c,
-                Err(e) => return Response::err(e),
+                Err(e) => return err_response(e),
             };
             let s = soul.lock().await;
             Response::text(200, s.holo.read(&coord).unwrap_or_default())
@@ -315,7 +249,7 @@ async fn route(
         ("POST", "/api/v2/update") => {
             let coord = match params.get("c").ok_or_else(|| "missing c".to_string()).and_then(|c| parse_coord(c)) {
                 Ok(c) => c,
-                Err(e) => return Response::err(e),
+                Err(e) => return err_response(e),
             };
             let s = soul.lock().await;
             // holo-phext rejects Set("") ("would delete the scroll; use
@@ -328,13 +262,13 @@ async fn route(
             };
             match s.holo.commit(txn).await {
                 Ok(_) => Response::text(200, ""),
-                Err(e) => Response::err(format!("commit: {e}")),
+                Err(e) => err_response(format!("commit: {e}")),
             }
         }
         ("POST", "/api/v2/insert") => {
             let coord = match params.get("c").ok_or_else(|| "missing c".to_string()).and_then(|c| parse_coord(c)) {
                 Ok(c) => c,
-                Err(e) => return Response::err(e),
+                Err(e) => return err_response(e),
             };
             let s = soul.lock().await;
             let mut cur = s.holo.read(&coord).unwrap_or_default();
@@ -346,7 +280,7 @@ async fn route(
             };
             match s.holo.commit(txn).await {
                 Ok(_) => Response::text(200, ""),
-                Err(e) => Response::err(format!("commit: {e}")),
+                Err(e) => err_response(format!("commit: {e}")),
             }
         }
         ("GET", "/api/v2/toc") => {
@@ -373,33 +307,33 @@ async fn route(
         ("POST", "/api/v2/txn") => {
             let v: serde_json::Value = match serde_json::from_str(&body_str) {
                 Ok(v) => v,
-                Err(e) => return Response::err(format!("json: {e}")),
+                Err(e) => return err_response(format!("json: {e}")),
             };
             let writes = match v.get("writes").and_then(|w| w.as_array()) {
                 Some(w) => w.clone(),
-                None => return Response::err("missing writes array"),
+                None => return err_response("missing writes array"),
             };
             let mut txn = Txn::new();
             for w in &writes {
                 let pair = match w.as_array() {
                     Some(p) if p.len() == 2 => p,
-                    _ => return Response::err("writes entries must be [coord, text]"),
+                    _ => return err_response("writes entries must be [coord, text]"),
                 };
                 let (cs, ts) = (pair[0].as_str(), pair[1].as_str());
                 let (cs, ts) = match (cs, ts) {
                     (Some(a), Some(b)) => (a, b),
-                    _ => return Response::err("writes entries must be strings"),
+                    _ => return err_response("writes entries must be strings"),
                 };
                 match parse_coord(cs) {
                     Ok(c) if ts.is_empty() => txn = txn.delete(c),
                     Ok(c) => txn = txn.set(c, ts),
-                    Err(e) => return Response::err(e),
+                    Err(e) => return err_response(e),
                 }
             }
             let s = soul.lock().await;
             match s.holo.commit(txn).await {
                 Ok(seq) => Response::json(200, serde_json::json!({"seq": seq})),
-                Err(e) => Response::err(format!("commit: {e}")),
+                Err(e) => err_response(format!("commit: {e}")),
             }
         }
         ("GET", "/api/v2/seq") => {
@@ -409,7 +343,7 @@ async fn route(
         ("GET", "/api/v2/updates") => {
             let since: u64 = match params.get("since").and_then(|v| v.parse().ok()) {
                 Some(n) => n,
-                None => return Response::err("missing/invalid since"),
+                None => return err_response("missing/invalid since"),
             };
             let s = soul.lock().await;
             if let Some(front) = s.ring.front() {
@@ -428,7 +362,7 @@ async fn route(
         ("POST", "/api/v2/checkpoint") => {
             let s = soul.lock().await;
             if let Err(e) = s.holo.checkpoint().await {
-                return Response::err(format!("checkpoint: {e}"));
+                return err_response(format!("checkpoint: {e}"));
             }
             let main_path = state.data_dir.join(format!("{stem}.phext"));
             let wal_path = state.data_dir.join(format!("{stem}.wal.phext"));
@@ -442,7 +376,7 @@ async fn route(
         ("POST", "/api/v2/quads") => {
             let v: serde_json::Value = match serde_json::from_str(&body_str) {
                 Ok(v) => v,
-                Err(e) => return Response::err(format!("json: {e}")),
+                Err(e) => return err_response(format!("json: {e}")),
             };
             let mut s = soul.lock().await;
             // The line set stays the dedup authority (exact-line
@@ -462,7 +396,7 @@ async fn route(
                     if let Some(line) = q.as_str() {
                         if quad_set.insert(line.to_string()) {
                             if let Err(e) = source.push_nt_line(line) {
-                                return Response::err(format!("quads: {e}"));
+                                return err_response(format!("quads: {e}"));
                             }
                             quads.push(line.to_string());
                         }
@@ -474,7 +408,7 @@ async fn route(
                         if let Some(line) = q.as_str() {
                             if quad_set.insert(line.to_string()) {
                                 if let Err(e) = source.push_nt_line(line) {
-                                    return Response::err(format!("quads: {e}"));
+                                    return err_response(format!("quads: {e}"));
                                 }
                                 quads.push(line.to_string());
                             }
@@ -486,7 +420,7 @@ async fn route(
                         if let Some(line) = q.as_str() {
                             if quad_set.remove(line) {
                                 if let Err(e) = source.remove_nt_line(line) {
-                                    return Response::err(format!("quads: {e}"));
+                                    return err_response(format!("quads: {e}"));
                                 }
                                 quads.retain(|x| x != line);
                             }
@@ -504,7 +438,7 @@ async fn route(
             let prep_text = match headers.get("x-prep-b64") {
                 Some(b64) => match b64_decode(b64) {
                     Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-                    Err(e) => return Response::err(e),
+                    Err(e) => return err_response(e),
                 },
                 None => None,
             };
@@ -521,73 +455,6 @@ async fn route(
         }
         _ => Response::text(404, "ERROR\tnot found\n"),
     }
-}
-
-async fn handle(state: Arc<State>, mut stream: TcpStream) {
-    let _ = async {
-        let mut buf: Vec<u8> = Vec::with_capacity(8192);
-        let mut chunk = [0u8; 8192];
-        let head_end = loop {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                return Ok::<(), std::io::Error>(());
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos + 4;
-            }
-            if buf.len() > 1 << 20 {
-                return Ok(());
-            }
-        };
-        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-        let mut lines = head.lines();
-        let request_line = lines.next().unwrap_or("");
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or("").to_string();
-        let target = parts.next().unwrap_or("").to_string();
-        let mut headers: HashMap<String, String> = HashMap::new();
-        for line in lines {
-            if let Some((k, v)) = line.split_once(':') {
-                headers.insert(k.trim().to_lowercase(), v.trim().to_string());
-            }
-        }
-        let content_len: usize = headers
-            .get("content-length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let mut body: Vec<u8> = buf[head_end..].to_vec();
-        while body.len() < content_len {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..n]);
-        }
-        body.truncate(content_len);
-        let (path, qs) = target.split_once('?').unwrap_or((&target, ""));
-        let params = parse_query_str(qs);
-        let resp = route(&state, &method, path, &params, &headers, &body).await;
-        let reason = match resp.status {
-            200 => "OK",
-            400 => "Bad Request",
-            404 => "Not Found",
-            _ => "Error",
-        };
-        let mut head_out = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-            resp.status, reason, resp.content_type, resp.body.len()
-        );
-        for (k, v) in &resp.extra {
-            head_out.push_str(&format!("{k}: {v}\r\n"));
-        }
-        head_out.push_str("\r\n");
-        stream.write_all(head_out.as_bytes()).await?;
-        stream.write_all(&resp.body).await?;
-        stream.flush().await?;
-        Ok(())
-    }
-    .await;
 }
 
 #[tokio::main]
@@ -627,21 +494,12 @@ async fn main() {
             let _ = tokio::signal::ctrl_c().await;
         }
     };
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, _)) => {
-                        let st = state.clone();
-                        tokio::spawn(async move { handle(st, stream).await });
-                    }
-                    Err(e) => eprintln!("accept: {e}"),
-                }
-            }
-            _ = &mut shutdown => break,
-        }
-    }
+    let handler_state = state.clone();
+    http::serve_with_shutdown(listener, move |req| {
+        let st = handler_state.clone();
+        async move { route(&st, &req).await }
+    }, shutdown)
+    .await;
     eprintln!("phext-serve stopping: checkpointing all open souls");
     let souls: Vec<Arc<Mutex<Soul>>> = {
         let map = state.souls.lock().await;

@@ -1,7 +1,7 @@
 //! Who is asking raveld, and whether they may. Every request passes here
 //! before its handler, so the whole rule is in one file.
 //!
-//! The checking itself is tessera's (the stack's shared crate): the token,
+//! The checking itself is the in-tree tessera port's (`crate::tessera`): the token,
 //! the key list in `~/.lex/identity/jwks.json`, service grants, the machine
 //! owner. ravel only says which route needs what.
 //!
@@ -23,14 +23,9 @@
 
 use super::registry::Soul;
 use super::Daemon;
-use axum::extract::{Request, State};
-use axum::http::{header, Method, StatusCode};
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use phext_serve::http::{Request, Response};
 use serde_json::json;
-use std::sync::Arc;
-use tessera::{Caller, Owner};
+use crate::tessera::{Caller, Owner};
 
 /// Phase 5 turns this on, in every daemon at once.
 pub const READS_NEED_A_TOKEN: bool = false;
@@ -49,17 +44,14 @@ pub enum Needs<'a> {
 }
 
 /// The one table of routes. A path not listed here is a read.
-pub fn needs<'a>(method: &Method, path: &'a str) -> Needs<'a> {
+pub fn needs<'a>(method: &str, path: &'a str) -> Needs<'a> {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
-        (&Method::GET, ["ravel", "health"]) | (&Method::GET, ["ravel", "stores"]) => {
-            Needs::Nothing
+        ("GET", ["ravel", "health"]) | ("GET", ["ravel", "stores"]) => Needs::Nothing,
+        ("POST", ["ravel", "sync"]) | ("POST", ["ravel", "shutdown"]) => Needs::MachineOwner,
+        ("POST", ["ravel", org, store, "sync"]) | ("POST", ["ravel", org, store, "import"]) => {
+            Needs::WriteSoul(org, store)
         }
-        (&Method::POST, ["ravel", "sync"]) | (&Method::POST, ["ravel", "shutdown"]) => {
-            Needs::MachineOwner
-        }
-        (&Method::POST, ["ravel", org, store, "sync"])
-        | (&Method::POST, ["ravel", org, store, "import"]) => Needs::WriteSoul(org, store),
         _ => Needs::Read,
     }
 }
@@ -80,7 +72,7 @@ fn no_token(what: &str) -> Refusal {
              `git lex identity token` prints one, after `git lex identity bind` in the soul's folder. \
              The `ravel` command sends it by itself."
         ),
-        www_authenticate: Some(format!("Bearer realm=\"{}\"", tessera::AUDIENCE)),
+        www_authenticate: Some(format!("Bearer realm=\"{}\"", crate::tessera::AUDIENCE)),
     }
 }
 
@@ -94,7 +86,7 @@ fn scope(caller: &Caller, word: &str) -> Result<(), Refusal> {
     if caller.actor.is_none() {
         return Ok(());
     }
-    tessera::require_scope(caller, word).map_err(|d| Refusal {
+    crate::tessera::require_scope(caller, word).map_err(|d| Refusal {
         status: d.http_status(),
         reason: d.reason().to_string(),
         www_authenticate: d.www_authenticate(),
@@ -160,10 +152,9 @@ pub fn decide(
 }
 
 fn respond(r: Refusal) -> Response {
-    let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::FORBIDDEN);
-    let mut resp = (status, Json(json!({ "error": r.reason }))).into_response();
-    if let Some(v) = r.www_authenticate.and_then(|v| v.parse().ok()) {
-        resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+    let mut resp = Response::json(r.status, json!({ "error": r.reason }));
+    if let Some(v) = r.www_authenticate {
+        resp.extra.push(("WWW-Authenticate".into(), v));
     }
     resp
 }
@@ -175,37 +166,35 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The layer every route sits behind.
-pub async fn check(State(d): State<Arc<Daemon>>, req: Request, next: Next) -> Response {
-    let needs = needs(req.method(), req.uri().path());
+/// The gate every route sits behind: `Some(response)` refuses the
+/// request here; `None` lets it through to its handler.
+pub fn check(d: &Daemon, req: &Request) -> Option<Response> {
+    let needs = needs(&req.method, &req.path);
     if needs == Needs::Nothing {
-        return next.run(req).await;
+        return None;
     }
-    let authorization = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .map(|v| v.to_str().unwrap_or("\u{0}"));
+    let authorization = req.header("authorization");
     // A header that is sent and is not a good token is refused on every
     // route, reads included: a caller who thinks it is identified must not
     // be served as nobody.
     let caller = match d.keys.identify(authorization, now()) {
         Ok(c) => c,
         Err(why) => {
-            return respond(Refusal {
+            return Some(respond(Refusal {
                 status: 401,
-                www_authenticate: Some(tessera::www_authenticate_invalid_token(&why.0)),
+                www_authenticate: Some(crate::tessera::www_authenticate_invalid_token(&why.0)),
                 reason: why.0,
-            })
+            }))
         }
     };
     let owner = match d.keys.owner() {
         Ok(o) => o,
         Err(why) => {
-            return respond(Refusal {
+            return Some(respond(Refusal {
                 status: 500,
                 reason: format!("the machine owner record cannot be read: {}", why.0),
                 www_authenticate: None,
-            })
+            }))
         }
     };
     let soul = match &needs {
@@ -213,8 +202,8 @@ pub async fn check(State(d): State<Arc<Daemon>>, req: Request, next: Next) -> Re
         _ => None,
     };
     match decide(&needs, caller.as_ref(), soul, owner.as_ref(), READS_NEED_A_TOKEN) {
-        Ok(()) => next.run(req).await,
-        Err(r) => respond(r),
+        Ok(()) => None,
+        Err(r) => Some(respond(r)),
     }
 }
 
@@ -263,7 +252,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_token_is_identified() {
-        let keys = tessera::HostKeys::new(crate::daemon::identity_dir().join("jwks.json"));
+        let keys = crate::tessera::HostKeys::new(crate::daemon::identity_dir().join("jwks.json"));
         let header = format!("Bearer {}", std::env::var("RAVEL_TOKEN").expect("RAVEL_TOKEN"));
         let c = keys.identify(Some(&header), now()).unwrap().expect("a caller");
         let owner = keys.owner().unwrap();
@@ -276,19 +265,19 @@ mod tests {
 
     #[test]
     fn the_route_table() {
-        assert_eq!(needs(&Method::GET, "/ravel/health"), Needs::Nothing);
-        assert_eq!(needs(&Method::GET, "/ravel/stores"), Needs::Nothing);
-        assert_eq!(needs(&Method::POST, "/ravel/sync"), Needs::MachineOwner);
-        assert_eq!(needs(&Method::POST, "/ravel/shutdown"), Needs::MachineOwner);
-        assert_eq!(needs(&Method::POST, "/ravel/7r1pl3f0rc3/spacegoat/sync"), Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"));
-        assert_eq!(needs(&Method::POST, "/ravel/7r1pl3f0rc3/spacegoat/import"), Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"));
-        assert_eq!(needs(&Method::POST, "/ravel/7r1pl3f0rc3/spacegoat/query"), Needs::Read);
-        assert_eq!(needs(&Method::POST, "/ravel/7r1pl3f0rc3/spacegoat/sparql"), Needs::Read);
-        assert_eq!(needs(&Method::GET, "/ravel/7r1pl3f0rc3/spacegoat/memory"), Needs::Read);
+        assert_eq!(needs("GET", "/ravel/health"), Needs::Nothing);
+        assert_eq!(needs("GET", "/ravel/stores"), Needs::Nothing);
+        assert_eq!(needs("POST", "/ravel/sync"), Needs::MachineOwner);
+        assert_eq!(needs("POST", "/ravel/shutdown"), Needs::MachineOwner);
+        assert_eq!(needs("POST", "/ravel/7r1pl3f0rc3/spacegoat/sync"), Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"));
+        assert_eq!(needs("POST", "/ravel/7r1pl3f0rc3/spacegoat/import"), Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"));
+        assert_eq!(needs("POST", "/ravel/7r1pl3f0rc3/spacegoat/query"), Needs::Read);
+        assert_eq!(needs("POST", "/ravel/7r1pl3f0rc3/spacegoat/sparql"), Needs::Read);
+        assert_eq!(needs("GET", "/ravel/7r1pl3f0rc3/spacegoat/memory"), Needs::Read);
         // A route added later and not listed is held as a read, never open.
-        assert_eq!(needs(&Method::GET, "/ravel/7r1pl3f0rc3/spacegoat/anything-new"), Needs::Read);
+        assert_eq!(needs("GET", "/ravel/7r1pl3f0rc3/spacegoat/anything-new"), Needs::Read);
         // GET on a write path is not a write, and is not open either.
-        assert_eq!(needs(&Method::GET, "/ravel/shutdown"), Needs::Read);
+        assert_eq!(needs("GET", "/ravel/shutdown"), Needs::Read);
     }
 
     #[test]

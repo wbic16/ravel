@@ -100,13 +100,8 @@ fn note_prompt(
 }
 
 fn local_time(ts: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|t| {
-            t.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M %:z")
-                .to_string()
-        })
-        .unwrap_or_else(|_| ts.to_string())
+    crate::time::parse_local_format(ts, "%Y-%m-%d %H:%M %:z")
+        .unwrap_or_else(|| ts.to_string())
 }
 
 /// One model call, tried up to four times with a growing pause: a rate limit
@@ -509,7 +504,7 @@ fn merge(
         block: memory::block_id(b),
         text,
         model: llm.model().to_string(),
-        written: chrono::Utc::now().to_rfc3339(),
+        written: crate::time::now_rfc3339(),
         // A rebuild with extra words is a trial, not the current wording.
         wording: Some(
             if extra.is_some() {
@@ -755,7 +750,7 @@ pub fn reword_parallel(
                         block: memory::block_id(b),
                         text,
                         model: llm.model().to_string(),
-                        written: chrono::Utc::now().to_rfc3339(),
+                        written: crate::time::now_rfc3339(),
                         wording: Some(memory_log::WORDING.to_string()),
                     };
                     log.append_summary(&sm)?;
@@ -1189,8 +1184,8 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     let names = crate::names::Names::for_soul(repo)?;
     let nt = memory_log::project_nt(&names, &ms, &sums);
     v.nt_triples = nt.lines().count();
-    let mem = oxigraph::store::Store::new()?;
-    mem.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
+    let mem = crate::graph::Store::new()?;
+    mem.load_nt(&nt, None)?;
     let dangling = crate::graph::query_rows(
         &mem,
         &format!(
@@ -1209,7 +1204,7 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     }
     // Every cited turn is a Turn node in the soul's own store.
     let store_dir = repo.join(crate::sync::STORE_SUBDIR);
-    if store_dir.join("CURRENT").exists() {
+    if store_dir.join(crate::graph::STORE_FILE).exists() {
         let _hold = crate::graph::reading(&store_dir);
         let store = crate::graph::open_read_only(&store_dir)?;
         cited.sort();

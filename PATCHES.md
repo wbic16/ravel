@@ -53,3 +53,70 @@ What changed since the fork, and why. Divergence from upstream is recorded here,
 - `phext/serve/src/sparql.rs`: `QuadSource::quads_matching` is now a required method — VecSource is the estate's only implementation and overrides it from its indexes, so the filtered-listing default had no execution path (the agreement test still pins the contract); the two prep-expansion loops in `pattern_candidates` share one `expand_terms` fold; compiler warnings 2 → 0.
 - Measured on the STUDY §6.1 instrument, same basis before/after: LOC_prod 6,311 → 6,238; C 443.11 → 442.38 (ROI basis). The remaining SQ-attributable mass (~156 in-tree production lines + the SQ process and its 30 locked packages ≈ 31.6 C points) is quantified in `phext/OPTIMIZATION.md` as a separate decision — the SQ transport and the `RAVEL_TRANSPORT` default are untouched.
 - Behavior gate on the final tree, all green: harness 72/72 + Wavelets 19/19 in both transports; the dedup pass's 12-query differential battery byte-identical; scale driver point/ingest/mutation unregressed with store bytes byte-identical on all three souls; serve smokes 30/30 + 15/15; crate tests 30/30. Full record: the minimization section of `phext/OPTIMIZATION.md`.
+
+## 2026-11-27 — phext-only graph layer: the fork's first upstream-modifying change
+
+Will's direction (2026-11-27 01:10 CST): "rewrite the graph layer in terms of phext only — get a clean pass from ashfall." This entry is the fork's FIRST divergence that modifies upstream ravel files (every prior entry added files under `phext/` or left upstream code untouched). Upstream's graph layer (repolex-ai's Oxigraph store, calamus ontology rewriter, spargebra query type) is replaced by the phext store and evaluator already living in this repo under `phext/serve/` — Emise's work, not repolex's; nothing here claims upstream's design, which the replacement deliberately mirrors at the seam so the rest of the crate did not have to change shape.
+
+### What changed, file by file
+
+- `phext/serve/src/sparql.rs` — the evaluator library gains the public store API the native crate needs, surfaced from machinery that already existed inside it: `VecSource::quads_for_pattern` (index-backed pattern read; was evaluator-internal `QuadSource::quads_matching`), `len()`, `contains_named_graph()`, `clear_graph()`, set-semantics `insert()`/`remove()`, `to_nquads()`; cooperative cancellation — `evaluate_with_stop` / `evaluate_with_stop_view` with a deadline and a caller-held stop flag polled by `check_deadline()` in the hot loops (the native 30 s policy's counterpart); `evaluate_own_default` (default graph = the source's own only, the native internal-query semantics, beside the union rule the outside surface uses); `collect_left` made public.
+- `src/graph.rs` — rewritten on the phext store. `Store` = the evaluator's `VecSource` behind a lock, persisted as N-Quads text (`store.nq` in the store directory, written whole and atomically by `flush()`); the term/quad/result types keep the shapes the crate already spoke, over phext terms. The reader/writer turnstile is kept as process-level coordination (its RocksDB failure mode cannot occur in the phext store). `ingest_*` / `append_transcript` / `describe_graph` / `drop_graph` / `keep_recent` / `query_rows` / `query_emojikeys` all run on the phext store + evaluator. Store markers: `CURRENT` → `store.nq` everywhere it was checked.
+- `src/ttl.rs` — NEW. A purpose-built Turtle reader: the Rust port of the phext backend's `_ttl_triples` (itself the calamus-Index port), extended to keep literal objects. It seats the ontology Prep, the ontology test loads, and the CLI's query-help. It is not a general Turtle parser (blank-node blocks and collections are skipped, as in the Python reader).
+- `src/outside.rs` — the calamus seam cut. The ontology rewrite is applied as Prep data: calamus's closure ported in Rust (the same port the backend's `ontology_prep()` runs; V2-REPORT had already proven 13/13 outside shapes row-equal). Parsing is the phext parser's; out-of-subset constructs are refused by name. Cancellation rides the evaluator's stop flag.
+- `src/readdress.rs` — NOT retired: `open_current` is a live caller (sync writers, memory_log), so the move is re-implemented on the phext store (iterate, rewrite IRIs including inside triple terms, insert; text is never touched, as before). Building/kept directory names change `oxigraph.*` → `phext.*`. (The phext-backend position in STUDY.md — that the tool is obviated where addresses are coordinate-derived text — stands for that seat; the native seat still holds pre-0.10 stores under old addresses.)
+- `src/sync.rs` — `owned_here` reads patterns through the surfaced store API; `diagnose` evaluates through `graph::eval_query` and reports a missing store as "not a phext store (no store.nq)". The store directory keeps its name (`.ravel/_ignore/oxigraph`) for layout compatibility; its contents are `store.nq` text now.
+- `src/memory_log.rs`, `src/memory_relive.rs`, `src/project.rs`, `src/annotate.rs` — store loads through `load_nt` / `load_ttl` / `load_nq`; annotation dumps through `dump_nquads()`; tests re-seated on `eval_query`.
+- `src/daemon/http.rs` — query evaluation through `graph::eval_query`; the cancellation token is `graph::CancellationToken` (the evaluator's stop flag); store-presence check reads `store.nq`.
+- `src/bin/ravel.rs` — `query help`'s ontology walk uses `ttl::triples` instead of an RDF parser.
+- `src/lib.rs` — `pub mod ttl`; module doc updated.
+- `Cargo.toml` / `Cargo.lock` — removed (see list below); the root crate path-depends on `phext-serve` (in-repo library: one evaluator, one store, two seats).
+- `python/pyproject.toml`, `python/src/weave/graph/store.py`, `__init__.py`, `__main__.py`, `project.py`, `python/tests/test_graph.py` — the lab's pyoxigraph binding is removed and the `graph` extra with it; `weave.graph.store` is re-pointed at the phext evaluator's line-protocol process (`phext-sparql`), holding the projection as a set of N-Triples lines (idempotence unchanged). Lab-only, as the census found; no production caller existed.
+- `config.example.yml`, `ontology/ravel/ravel.ttl`, `ontology/subtexture/subtexture.ttl` (+ the mirrored copies under `phext/backend/ontology/`) — prose comments now name the phext graph store. One `rdfs:comment` literal in subtexture.ttl still says "Oxigraph store" — it is ontology data, left untouched rather than silently edited.
+
+### Removed dependencies
+
+Root `Cargo.lock`: **240 → 187 packages**. Gone with the graph layer: oxigraph, spargebra, sparesults, spareval, sparopt, oxrdf, oxrdfio, oxjsonld, oxrdfxml, oxrocksdb-sys, oxiri, oxilangtag, oxsdatatypes, oxttl, calamus, and everything reachable only through them (the RocksDB/bindgen/clang chain, dashmap, the regex crate chain, peg, and the rest — 53 packages net after the phext-serve path dependency's tree merged in). Python: pyoxigraph and the `graph` extra.
+
+### NOT removed — tessera (decision point, recorded deliberately)
+
+Tessera stays. It is not identity helpers: it is the daemon's authorization gate (`src/daemon/gate.rs` — Caller/Owner/scope checks on every request; `HostKeys` in `src/daemon/mod.rs`). Removing or re-implementing it is a coordinator decision, not part of this rewrite; ashfall continues to flag it exactly as it did at baseline.
+
+### Ruled divergences kept (SPARQL-SUBSET ruling C1)
+
+Full SPARQL beyond the subset, blank nodes, and empty-string literals are not chased: the phext parser refuses out-of-subset constructs by name, as before. Existing pre-rewrite RocksDB stores are not read by the new layer — the graph is a rebuildable projection and sync re-ingests it from the transcripts.
+
+### Gates at this commit (aletheia-core, 2026-11-27)
+
+- `cargo build` + `cargo build --release`: green, root and phext-serve.
+- `cargo test` root: **141 passed, 0 failed** (12 ignored, as at baseline). phext-serve: **30 passed, 0 failed**.
+- Ravel harness on the phext backend: **72/72** checks ok. Wavelets: **19/19**.
+- 12-query differential battery vs the recorded phext-transport digests: **12/12 byte-identical** (the Oxigraph reference oracle is gone by design; the comparison is against the recorded phext digests in `~/ravel-min-work/digests-before/` on the hub).
+- Ashfall (report mode, policy as of this run — the audit leg's expanded phext, 61 pass audits): root 198 → **134** violations, transitive 239 → 185, duplicates 9 → 5, and every oxigraph-family finding gone; phext-serve 12 → **2** (the holo-phext git source, twice). The root tree still FAILs ashfall on pre-existing, non-graph findings — the unaudited axum/reqwest/tokio stacks, the tessera stop above, the new phext-serve path dep's own missing audit scroll, and the 60-package budget at 185 — which are the audit leg's and the coordinator's to close, not this rewrite's.
+
+## 2026-11-27 — ashfall convergence (leg D): the tree passes ashfall clean
+
+Will's direction, continued: a **clean ashfall pass over the whole tree**. Every remaining finding from the leg-C entry above is closed here. Ashfall final (policy 63 PASS audits, audits.phext CURRENT, sha256 5ea51413): **ravel PASS (direct 8, transitive 37 of budget 60, 0 violations); phext-serve PASS (direct 4, transitive 27, 0 violations)**. Root lock: 187 → 40 packages. Stage commits: `03ee5a9` (holo-phext vendoring), `1e7e78c` (tessera port), `78cbeb1` (axum), `7359de3` (reqwest), `bec48d5` (chrono), `548f33a` (serde_yaml), plus the serde alignment and this entry.
+
+### Tessera — ported in-tree (was: git dependency, 36 packages)
+
+The git dep is gone. Tessera 0.1.1 @ `1142eb66066624ebfa405b7679b3731e72b8fc4f` (repolex) is **ported file-for-file** into `src/tessera/` (mod/verify/access/keyring) — this is a port of repolex's tessera gate surface, credited here as PATCHES.md requires; the code is theirs, the port is ours. One substitution: tessera's Ed25519 verification (ed25519-dalek) is replaced by an in-tree verifier, `src/ed25519.rs`, because dalek's derive chain forces a second `syn` major version, which ashfall's no-duplicates rule forbids. The verifier implements dalek's `verify_strict` semantics exactly (canonical-s check, small-order rejection for both key and R, RFC 8032 decompression incl. the x=0/sign-bit refusal) and was differentially verified against dalek itself before the swap: 200 valid signatures accepted, 2,432 mutation/torsion cases, **0 disagreements**. All gate tests pass unchanged. Not constant-time — named in the module header: every input it checks is public (keys, signatures, messages), no secret is ever an input.
+
+### Axum — out; one HTTP stack
+
+raveld's HTTP surface re-seats on phext-serve's bare-tokio HTTP machinery, factored into the library as `phext_serve::http` (the phext-serve binary's own copy is deleted in favour of it). Routes are an explicit dispatch table in `src/daemon/http.rs`; the gate middleware is a plain function (`daemon::gate::check`). Named divergences: unmatched routes answer a JSON `{"error": …}` 404 instead of axum's empty 404; `POST /ravel/shutdown` delays its stop signal 250 ms so the answer lands before the server returns (axum's graceful drain used to cover that).
+
+### Reqwest — out (ladder rung b)
+
+Call sites, logged before the cut: `src/client.rs` (blocking, plain HTTP to raveld on 127.0.0.1), `src/writer.rs` `AnthropicApi` (the tree's only HTTPS call: POST api.anthropic.com, behind the macOS keychain, on the hand-run reword-api path), daemon HTTP tests (now a raw tokio client). Rung (a) was measured and refused on duplicates, not count: rustls+ring drags `windows-sys` 0.52 beside tokio's 0.61; native-tls drags a second `syn` and `tempfile` — a crate with an ashfall verdict of FAIL — via rustix. So: plain HTTP is implemented in-tree (`src/http_client.rs`; no redirects followed — raveld never redirects), and the Anthropic call runs through a Python-stdlib (urllib+ssl) helper embedded in `src/writer.rs`, the API key travelling only inside the request JSON on the helper's stdin. The daemon contract is unchanged; the harness stays 72/72.
+
+### Chrono, serde_yaml — replaced in-tree; anyhow — audited
+
+- Chrono's used surface (RFC 3339 parse/format, local time, durations) is re-implemented in `src/time.rs` (local time via libc `localtime_r`); its ~28-package platform tree is gone.
+- serde_yaml is replaced by a ~150-line reader in `src/daemon/config.rs` for config.yml's actual grammar. unsafe-libyaml beneath serde_yaml is a C transliteration; it was not passed on a thin examination — the honest move was the small reader, which refuses shapes outside the config grammar rather than guessing.
+- anyhow stays, now with a genuine PASS audit scroll (zero dependencies; unsafe confined to its type-erasure core, named in the scroll). phext-serve likewise gained its first-party PASS scroll.
+- Duplicates, all resolved: cpufeatures, getrandom, rand_core (left with the reqwest/quinn and tessera/dalek chains), windows-sys 0.52 (left with ring), syn 2.0.118 (root serde aligned to phext-serve's 1.0.229, whose derive uses syn 3).
+
+### holo-phext — vendored
+
+holo-phext is definitively not on crates.io (API + sparse index checked 2026-11-27). It is vendored byte-for-byte at `phext/serve/vendor/holo-phext/` (upstream wbic16/holo-phext rev `bafed5f36ebfad92f1011fe5c2bd8bdd3c3a9511`, 0.2.5, MIT, PROVENANCE.md in place) and path-depended from phext-serve. (The coordinator's brief named `phext/vendor/holo-phext/`; ashfall flags a path dep escaping phext-serve's project tree as unvendorable, so the vendor copy lives inside the serve project — deviation recorded here and in REWRITE-LOG.) No exceptions.toml entry was needed.

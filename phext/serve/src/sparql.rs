@@ -58,11 +58,23 @@ pub struct Literal {
 
 impl Literal {
     pub fn simple(value: &str) -> Self {
-        Literal { value: value.to_string(), datatype: None, lang: None }
+        Literal {
+            value: value.to_string(),
+            datatype: None,
+            lang: None,
+        }
     }
     pub fn typed(value: &str, datatype: &str) -> Self {
-        let dt = if datatype == XSD_STRING { None } else { Some(datatype.to_string()) };
-        Literal { value: value.to_string(), datatype: dt, lang: None }
+        let dt = if datatype == XSD_STRING {
+            None
+        } else {
+            Some(datatype.to_string())
+        };
+        Literal {
+            value: value.to_string(),
+            datatype: dt,
+            lang: None,
+        }
     }
     pub fn datatype_str(&self) -> &str {
         if self.lang.is_some() {
@@ -71,7 +83,10 @@ impl Literal {
         self.datatype.as_deref().unwrap_or(XSD_STRING)
     }
     pub fn is_numeric(&self) -> bool {
-        matches!(self.datatype.as_deref(), Some(XSD_INTEGER) | Some(XSD_DECIMAL))
+        matches!(
+            self.datatype.as_deref(),
+            Some(XSD_INTEGER) | Some(XSD_DECIMAL)
+        )
     }
 }
 
@@ -309,7 +324,12 @@ impl VecSource {
     }
 
     pub fn push(&mut self, graph: Option<&str>, s: Term, p: Term, o: Term) {
-        self.push_quad(Quad { graph: graph.map(str::to_string), s, p, o });
+        self.push_quad(Quad {
+            graph: graph.map(str::to_string),
+            s,
+            p,
+            o,
+        });
     }
     /// Read N-Quads / N-Triples text (a quad per line; triple terms and
     /// typed literals included). Errors name the line.
@@ -348,6 +368,112 @@ impl VecSource {
         }
         Ok(removed)
     }
+
+    // ── public store API (surfaced 2026-11-27 for the ravel root crate's
+    // phext graph layer; previously these existed only inside the
+    // evaluator as QuadSource::quads_matching) ──────────────────────────
+
+    /// Number of quads in the store (the old store's `len()`).
+    pub fn len(&self) -> usize {
+        self.quads.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.quads.is_empty()
+    }
+
+    /// Whether any quad lives in the named graph `graph`.
+    pub fn contains_named_graph(&self, graph: &str) -> bool {
+        self.graph_counts.contains_key(&Some(graph.to_string()))
+    }
+
+    /// Pattern read over the whole store: `None` in a term position is a
+    /// wildcard; `graph` is the graph to read (`None` = every graph,
+    /// `Some(None)` = the default graph only, `Some(Some(g))` = graph g).
+    /// Bound positions answer from the position indexes.
+    pub fn quads_for_pattern(
+        &self,
+        s: Option<&Term>,
+        p: Option<&Term>,
+        o: Option<&Term>,
+        graph: Option<Option<&str>>,
+    ) -> Vec<Quad> {
+        let in_graph = |q: &Quad| match graph {
+            None => true,
+            Some(g) => q.graph.as_deref() == g,
+        };
+        // Start from the first bound position's index bucket, if any.
+        let mut out: Vec<Quad> = if let Some(t) = s {
+            self.quads_matching_any_graph(Pos::Subject, t)
+        } else if let Some(t) = p {
+            self.quads_matching_any_graph(Pos::Predicate, t)
+        } else if let Some(t) = o {
+            self.quads_matching_any_graph(Pos::Object, t)
+        } else {
+            self.quads.clone()
+        };
+        out.retain(|q| {
+            in_graph(q)
+                && s.map_or(true, |t| &q.s == t)
+                && p.map_or(true, |t| &q.p == t)
+                && o.map_or(true, |t| &q.o == t)
+        });
+        out
+    }
+
+    fn quads_matching_any_graph(&self, pos: Pos, term: &Term) -> Vec<Quad> {
+        let index = self.index_for(pos);
+        match index.get(term) {
+            Some(bucket) => bucket.iter().map(|&i| self.quads[i].clone()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Remove every quad in the named graph `graph` (None = default graph).
+    pub fn clear_graph(&mut self, graph: Option<&str>) {
+        let before = self.quads.len();
+        self.quads.retain(|q| q.graph.as_deref() != graph);
+        if self.quads.len() != before {
+            self.rebuild_indexes();
+        }
+    }
+
+    /// Insert one quad; returns whether it was new (the store is a set).
+    pub fn insert(&mut self, q: Quad) -> bool {
+        if self.quads.contains(&q) {
+            return false;
+        }
+        self.push_quad(q);
+        true
+    }
+
+    /// Remove one quad; returns whether it was present.
+    pub fn remove(&mut self, q: &Quad) -> bool {
+        let before = self.quads.len();
+        self.quads.retain(|x| x != q);
+        let removed = self.quads.len() != before;
+        if removed {
+            self.rebuild_indexes();
+        }
+        removed
+    }
+
+    /// The whole store as N-Quads text (the persistence form).
+    pub fn to_nquads(&self) -> String {
+        let mut out = String::new();
+        for q in &self.quads {
+            out.push_str(&q.s.to_nt());
+            out.push(' ');
+            out.push_str(&q.p.to_nt());
+            out.push(' ');
+            out.push_str(&q.o.to_nt());
+            if let Some(g) = &q.graph {
+                out.push_str(&format!(" <{g}>"));
+            }
+            out.push_str(" .\n");
+        }
+        out
+    }
 }
 
 /// The per-line parser both bulk and line-at-a-time ingestion share.
@@ -360,11 +486,7 @@ fn parse_nt_line(line: &str) -> Result<Quad, String> {
 
 impl QuadSource for VecSource {
     fn graph_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .graph_counts
-            .keys()
-            .filter_map(|g| g.clone())
-            .collect();
+        let mut names: Vec<String> = self.graph_counts.keys().filter_map(|g| g.clone()).collect();
         names.sort();
         names
     }
@@ -395,7 +517,10 @@ impl QuadSource for VecSource {
 }
 
 fn parse_nquad_line(line: &str) -> Result<Quad, String> {
-    let mut cur = NtCursor { chars: line.chars().collect(), at: 0 };
+    let mut cur = NtCursor {
+        chars: line.chars().collect(),
+        at: 0,
+    };
     let s = cur.term()?;
     let p = cur.term()?;
     let o = cur.term()?;
@@ -502,7 +627,11 @@ impl NtCursor {
                 if self.peek() == Some('@') {
                     self.at += 1;
                     let start = self.at;
-                    while self.chars.get(self.at).is_some_and(|c| c.is_alphanumeric() || *c == '-') {
+                    while self
+                        .chars
+                        .get(self.at)
+                        .is_some_and(|c| c.is_alphanumeric() || *c == '-')
+                    {
                         self.at += 1;
                     }
                     let lang: String = self.chars[start..self.at].iter().collect();
@@ -672,7 +801,10 @@ impl ParseError {
         }
     }
     fn plain(message: String) -> Self {
-        ParseError { construct: None, message }
+        ParseError {
+            construct: None,
+            message,
+        }
     }
 }
 
@@ -727,7 +859,11 @@ fn lex(text: &str) -> Result<Vec<Tok>, ParseError> {
     let cs: Vec<char> = text.chars().collect();
     let mut toks = Vec::new();
     let mut i = 0;
-    macro_rules! err { ($m:expr) => { ParseError::plain(format!("{} at character {}", $m, i)) }; }
+    macro_rules! err {
+        ($m:expr) => {
+            ParseError::plain(format!("{} at character {}", $m, i))
+        };
+    }
     while i < cs.len() {
         let c = cs[i];
         match c {
@@ -791,7 +927,10 @@ fn lex(text: &str) -> Result<Vec<Tok>, ParseError> {
                 }
             }
             '?' => {
-                if cs.get(i + 1).is_some_and(|n| n.is_alphanumeric() || *n == '_') {
+                if cs
+                    .get(i + 1)
+                    .is_some_and(|n| n.is_alphanumeric() || *n == '_')
+                {
                     let start = i + 1;
                     i = start;
                     while i < cs.len() && (cs[i].is_alphanumeric() || cs[i] == '_') {
@@ -942,7 +1081,9 @@ fn lex(text: &str) -> Result<Vec<Tok>, ParseError> {
                         i += 1;
                     }
                     toks.push(Tok::Str(value));
-                    toks.push(Tok::Lang(cs[start..i].iter().collect::<String>().to_lowercase()));
+                    toks.push(Tok::Lang(
+                        cs[start..i].iter().collect::<String>().to_lowercase(),
+                    ));
                 } else {
                     toks.push(Tok::Str(value));
                 }
@@ -961,9 +1102,7 @@ fn lex(text: &str) -> Result<Vec<Tok>, ParseError> {
                     i += 1;
                 }
                 let mut decimal = false;
-                if cs.get(i) == Some(&'.')
-                    && cs.get(i + 1).is_some_and(|n| n.is_ascii_digit())
-                {
+                if cs.get(i) == Some(&'.') && cs.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
                     decimal = true;
                     i += 1;
                     while i < cs.len() && cs[i].is_ascii_digit() {
@@ -1038,13 +1177,25 @@ struct Parser {
 /// Parse a query against a base IRI (relative addresses resolve against
 /// it). The base is the caller's — for ravel, the soul's root.
 pub fn parse_query(text: &str, base: &str) -> Result<Query, ParseError> {
-    let mut p = Parser { toks: lex(text)?, at: 0, base: base.to_string(), prefixes: HashMap::new() };
+    let mut p = Parser {
+        toks: lex(text)?,
+        at: 0,
+        base: base.to_string(),
+        prefixes: HashMap::new(),
+    };
     p.prologue()?;
     p.query()
 }
 
 const FUNCTIONS: &[&str] = &[
-    "STR", "STRSTARTS", "STRENDS", "CONTAINS", "LCASE", "DATATYPE", "REGEX", "SUBSTR",
+    "STR",
+    "STRSTARTS",
+    "STRENDS",
+    "CONTAINS",
+    "LCASE",
+    "DATATYPE",
+    "REGEX",
+    "SUBSTR",
 ];
 const AGGREGATES: &[&str] = &["COUNT", "MIN", "MAX"];
 
@@ -1104,7 +1255,10 @@ impl Parser {
         }
         if let Some(rest) = raw.strip_prefix('/') {
             if let Some(i) = self.base.find("://") {
-                let host_end = self.base[i + 3..].find('/').map(|j| i + 3 + j).unwrap_or(self.base.len());
+                let host_end = self.base[i + 3..]
+                    .find('/')
+                    .map(|j| i + 3 + j)
+                    .unwrap_or(self.base.len());
                 return format!("{}/{rest}", &self.base[..host_end]);
             }
             return raw.to_string();
@@ -1174,7 +1328,9 @@ impl Parser {
             template: Vec::new(),
             describe: Vec::new(),
             dataset: None,
-            group: Group { elements: Vec::new() },
+            group: Group {
+                elements: Vec::new(),
+            },
             group_by: Vec::new(),
             order_by: Vec::new(),
             limit: None,
@@ -1226,8 +1382,10 @@ impl Parser {
                 self.modifiers(&mut q)?;
             }
             Some(ref w)
-                if ["INSERT", "DELETE", "LOAD", "CLEAR", "DROP", "CREATE", "COPY", "MOVE", "ADD"]
-                    .contains(&w.as_str()) =>
+                if [
+                    "INSERT", "DELETE", "LOAD", "CLEAR", "DROP", "CREATE", "COPY", "MOVE", "ADD",
+                ]
+                .contains(&w.as_str()) =>
             {
                 return Err(ParseError::refused("SPARQL Update"));
             }
@@ -1311,22 +1469,37 @@ impl Parser {
                     self.expect(&Tok::LParen)?;
                     let e = self.expr()?;
                     self.expect(&Tok::RParen)?;
-                    OrderKey { expr: e, desc: false }
+                    OrderKey {
+                        expr: e,
+                        desc: false,
+                    }
                 } else if self.eat_word("DESC") {
                     self.expect(&Tok::LParen)?;
                     let e = self.expr()?;
                     self.expect(&Tok::RParen)?;
-                    OrderKey { expr: e, desc: true }
+                    OrderKey {
+                        expr: e,
+                        desc: true,
+                    }
                 } else if let Some(Tok::Var(v)) = self.peek().cloned() {
                     self.at += 1;
-                    OrderKey { expr: Expr::Var(v), desc: false }
+                    OrderKey {
+                        expr: Expr::Var(v),
+                        desc: false,
+                    }
                 } else if self.peek() == Some(&Tok::LParen) {
                     self.at += 1;
                     let e = self.expr()?;
                     self.expect(&Tok::RParen)?;
-                    OrderKey { expr: e, desc: false }
+                    OrderKey {
+                        expr: e,
+                        desc: false,
+                    }
                 } else if matches!(self.peek(), Some(Tok::Word(_))) {
-                    OrderKey { expr: self.expr()?, desc: false }
+                    OrderKey {
+                        expr: self.expr()?,
+                        desc: false,
+                    }
                 } else {
                     break;
                 };
@@ -1358,16 +1531,23 @@ impl Parser {
     }
 
     fn dataset(&mut self, q: &mut Query) -> Result<(), ParseError> {
-        let mut ds = Dataset { default: Vec::new(), named: Vec::new() };
+        let mut ds = Dataset {
+            default: Vec::new(),
+            named: Vec::new(),
+        };
         let mut any = false;
         loop {
             if self.eat_word("FROM") {
                 any = true;
                 if self.eat_word("NAMED") {
-                    let iri = self.iri_term()?.ok_or_else(|| self.err("FROM NAMED wants an IRI"))?;
+                    let iri = self
+                        .iri_term()?
+                        .ok_or_else(|| self.err("FROM NAMED wants an IRI"))?;
                     ds.named.push(iri);
                 } else {
-                    let iri = self.iri_term()?.ok_or_else(|| self.err("FROM wants an IRI"))?;
+                    let iri = self
+                        .iri_term()?
+                        .ok_or_else(|| self.err("FROM wants an IRI"))?;
                     ds.default.push(iri);
                 }
             } else {
@@ -1536,8 +1716,12 @@ impl Parser {
                 // A path operator after a predicate term is a path.
                 if matches!(
                     self.peek(),
-                    Some(Tok::Slash) | Some(Tok::Caret) | Some(Tok::Star) | Some(Tok::Plus)
-                        | Some(Tok::Quest) | Some(Tok::Pipe)
+                    Some(Tok::Slash)
+                        | Some(Tok::Caret)
+                        | Some(Tok::Star)
+                        | Some(Tok::Plus)
+                        | Some(Tok::Quest)
+                        | Some(Tok::Pipe)
                 ) {
                     return Err(ParseError::refused("property paths"));
                 }
@@ -1545,7 +1729,11 @@ impl Parser {
                     let Some(o) = self.pattern_term()? else {
                         return Err(self.err("wants an object"));
                     };
-                    out.push(TriplePattern { s: s.clone(), p: p.clone(), o });
+                    out.push(TriplePattern {
+                        s: s.clone(),
+                        p: p.clone(),
+                        o,
+                    });
                     if !self.eat(&Tok::Comma) {
                         break;
                     }
@@ -1575,16 +1763,28 @@ impl Parser {
             Some(Tok::Iri(raw)) => Ok(Some(PatternTerm::Term(Term::Iri(self.resolve(&raw))))),
             Some(Tok::PName(p, l)) => Ok(Some(PatternTerm::Term(Term::Iri(self.pname(&p, &l)?)))),
             Some(Tok::Lit(l)) => Ok(Some(PatternTerm::Term(Term::Literal(l)))),
-            Some(Tok::Str(s)) => Ok(Some(PatternTerm::Term(Term::Literal(self.literal_tail(s)?)))),
+            Some(Tok::Str(s)) => Ok(Some(PatternTerm::Term(Term::Literal(
+                self.literal_tail(s)?,
+            )))),
             Some(Tok::TripleOpen) => {
-                let s = self.pattern_term()?.ok_or_else(|| self.err("triple term wants a subject"))?;
-                let p = self.pattern_term()?.ok_or_else(|| self.err("triple term wants a predicate"))?;
-                let o = self.pattern_term()?.ok_or_else(|| self.err("triple term wants an object"))?;
+                let s = self
+                    .pattern_term()?
+                    .ok_or_else(|| self.err("triple term wants a subject"))?;
+                let p = self
+                    .pattern_term()?
+                    .ok_or_else(|| self.err("triple term wants a predicate"))?;
+                let o = self
+                    .pattern_term()?
+                    .ok_or_else(|| self.err("triple term wants an object"))?;
                 self.expect(&Tok::RParen)?;
                 if !self.eat(&Tok::TripleClose) {
                     return Err(self.err("triple term wants )>>"));
                 }
-                Ok(Some(PatternTerm::Triple(Box::new(TriplePattern { s, p, o }))))
+                Ok(Some(PatternTerm::Triple(Box::new(TriplePattern {
+                    s,
+                    p,
+                    o,
+                }))))
             }
             other => {
                 if other.is_some() {
@@ -1599,10 +1799,16 @@ impl Parser {
     /// ^^datatype.
     fn literal_tail(&mut self, value: String) -> Result<Literal, ParseError> {
         match self.next() {
-            Some(Tok::Lang(lang)) => Ok(Literal { value, datatype: None, lang: Some(lang) }),
+            Some(Tok::Lang(lang)) => Ok(Literal {
+                value,
+                datatype: None,
+                lang: Some(lang),
+            }),
             Some(Tok::Caret) => {
                 self.expect(&Tok::Caret)?;
-                let dt = self.iri_term()?.ok_or_else(|| self.err("^^ wants a datatype IRI"))?;
+                let dt = self
+                    .iri_term()?
+                    .ok_or_else(|| self.err("^^ wants a datatype IRI"))?;
                 Ok(Literal::typed(&value, &dt))
             }
             other => {
@@ -1677,7 +1883,10 @@ impl Parser {
             return Err(ParseError::refused("arithmetic expressions"));
         }
         let e = self.expr_primary()?;
-        if matches!(self.peek(), Some(Tok::Plus) | Some(Tok::Minus) | Some(Tok::Star) | Some(Tok::Slash)) {
+        if matches!(
+            self.peek(),
+            Some(Tok::Plus) | Some(Tok::Minus) | Some(Tok::Star) | Some(Tok::Slash)
+        ) {
             return Err(ParseError::refused("arithmetic expressions"));
         }
         Ok(e)
@@ -1795,7 +2004,10 @@ pub struct Prep {
 /// What a query produced.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Results {
-    Solutions { vars: Vec<String>, rows: Vec<Binding> },
+    Solutions {
+        vars: Vec<String>,
+        rows: Vec<Binding>,
+    },
     Boolean(bool),
     /// CONSTRUCT / DESCRIBE output (FRINGE): ground triples, deduplicated.
     Triples(Vec<Triple>),
@@ -1848,12 +2060,140 @@ impl fmt::Display for EvalError {
 }
 impl std::error::Error for EvalError {}
 
+thread_local! {
+    /// Cooperative deadline for the evaluation running on this thread
+    /// (the phext counterpart of the native store's 30 s cancellation
+    /// policy, seated 2026-11-27): hot loops poll it through
+    /// [`check_deadline`] and stop with an EvalError once it passes.
+    static DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    static DEADLINE_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// A caller-held cancellation flag (the native CancellationToken's
+    /// counterpart): another thread sets it, the evaluation stops.
+    static STOP: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Poll the cooperative deadline. Cheap: the clock is read once every
+/// 1024 polls. Errors once the deadline has passed.
+pub fn check_deadline() -> Result<(), EvalError> {
+    let n = DEADLINE_CHECKS.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        n
+    });
+    if n % 1024 != 0 {
+        return Ok(());
+    }
+    let stopped = STOP.with(|f| {
+        f.borrow()
+            .as_ref()
+            .map_or(false, |f| f.load(std::sync::atomic::Ordering::SeqCst))
+    });
+    let past = DEADLINE.with(|d| d.get().map_or(false, |t| std::time::Instant::now() >= t));
+    if stopped || past {
+        return Err(EvalError(
+            "query stopped: its deadline passed (cooperative cancellation)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Evaluate with a cooperative deadline: the counterpart of the native
+/// evaluator's cancellation token. `None` = no deadline (same as
+/// [`evaluate`]).
+pub fn evaluate_with_deadline<S: QuadSource>(
+    q: &Query,
+    src: &S,
+    prep: &Prep,
+    deadline: Option<std::time::Instant>,
+) -> Result<Outcome, EvalError> {
+    evaluate_with_stop(q, src, prep, deadline, None)
+}
+
+/// Evaluate with a cooperative deadline and/or a caller-held stop
+/// flag, choosing the dataset view: `own_default` = the internal-query
+/// semantics of [`evaluate_own_default`]; otherwise the union rule of
+/// [`evaluate`].
+pub fn evaluate_with_stop_view<S: QuadSource>(
+    q: &Query,
+    src: &S,
+    prep: &Prep,
+    deadline: Option<std::time::Instant>,
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    own_default: bool,
+) -> Result<Outcome, EvalError> {
+    DEADLINE.with(|d| d.set(deadline));
+    STOP.with(|f| *f.borrow_mut() = stop);
+    let out = if own_default {
+        evaluate_own_default(q, src, prep)
+    } else {
+        evaluate(q, src, prep)
+    };
+    DEADLINE.with(|d| d.set(None));
+    STOP.with(|f| *f.borrow_mut() = None);
+    out
+}
+
+/// Evaluate with a cooperative deadline and/or a caller-held stop flag.
+pub fn evaluate_with_stop<S: QuadSource>(
+    q: &Query,
+    src: &S,
+    prep: &Prep,
+    deadline: Option<std::time::Instant>,
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Outcome, EvalError> {
+    DEADLINE.with(|d| d.set(deadline));
+    STOP.with(|f| *f.borrow_mut() = stop);
+    let out = evaluate(q, src, prep);
+    DEADLINE.with(|d| d.set(None));
+    STOP.with(|f| *f.borrow_mut() = None);
+    out
+}
+
 /// Evaluate a parsed query over a source.
 pub fn evaluate<S: QuadSource>(q: &Query, src: &S, prep: &Prep) -> Result<Outcome, EvalError> {
-    let ev = Ev { src, prep, ds: DatasetView::resolve(q, src) };
+    evaluate_view(q, src, prep, None)
+}
+
+/// Evaluate with the default graph as ONLY the source's own default
+/// graph (no union), unless the query names its own dataset. This is
+/// the native store's internal-query semantics, seated 2026-11-27 for
+/// the ravel root crate: its working queries wrap what they mean in
+/// GRAPH ?g and read graph descriptions from the default graph alone,
+/// while the union rule above is the outside surface's rule.
+pub fn evaluate_own_default<S: QuadSource>(
+    q: &Query,
+    src: &S,
+    prep: &Prep,
+) -> Result<Outcome, EvalError> {
+    let view = if q.dataset.is_some() {
+        None
+    } else {
+        Some(DatasetView {
+            default_graphs: vec![None],
+            default_dedup: false,
+            named: src.graph_names(),
+        })
+    };
+    evaluate_view(q, src, prep, view)
+}
+
+fn evaluate_view<S: QuadSource>(
+    q: &Query,
+    src: &S,
+    prep: &Prep,
+    view: Option<DatasetView>,
+) -> Result<Outcome, EvalError> {
+    let ev = Ev {
+        src,
+        prep,
+        ds: view.unwrap_or_else(|| DatasetView::resolve(q, src)),
+    };
     let mut left: Vec<String> = Vec::new();
     collect_left(q, prep, &mut left);
     let sols = ev.eval_group(&q.group, &Ctx::Default, Binding::new())?;
+    check_deadline()?;
     let results = match q.kind {
         QueryKind::Ask => Results::Boolean(!sols.is_empty()),
         QueryKind::Select => {
@@ -1915,7 +2255,11 @@ pub fn evaluate<S: QuadSource>(q: &Query, src: &S, prep: &Prep) -> Result<Outcom
                 for quad in src.quads_matching(g.as_deref(), Pos::Subject, &target_terms) {
                     if let Term::Iri(s) = &quad.s {
                         if targets.binary_search(s).is_ok() {
-                            let t = Triple { s: quad.s.clone(), p: quad.p.clone(), o: quad.o.clone() };
+                            let t = Triple {
+                                s: quad.s.clone(),
+                                p: quad.p.clone(),
+                                o: quad.o.clone(),
+                            };
                             if seen.insert(t.clone()) {
                                 out.push(t);
                             }
@@ -1942,11 +2286,18 @@ pub fn evaluate<S: QuadSource>(q: &Query, src: &S, prep: &Prep) -> Result<Outcom
         },
         other => other,
     };
-    Ok(Outcome { results, left_as_written: left })
+    Ok(Outcome {
+        results,
+        left_as_written: left,
+    })
 }
 
 fn instantiate(pat: &TriplePattern, sol: &Binding) -> Option<Triple> {
-    Some(Triple { s: inst_term(&pat.s, sol)?, p: inst_term(&pat.p, sol)?, o: inst_term(&pat.o, sol)? })
+    Some(Triple {
+        s: inst_term(&pat.s, sol)?,
+        p: inst_term(&pat.p, sol)?,
+        o: inst_term(&pat.o, sol)?,
+    })
 }
 
 fn inst_term(pt: &PatternTerm, sol: &Binding) -> Option<Term> {
@@ -1958,7 +2309,7 @@ fn inst_term(pt: &PatternTerm, sol: &Binding) -> Option<Term> {
 }
 
 /// Names inside expressions that have other stored spellings.
-fn collect_left(q: &Query, prep: &Prep, out: &mut Vec<String>) {
+pub fn collect_left(q: &Query, prep: &Prep, out: &mut Vec<String>) {
     fn from_expr(e: &Expr, prep: &Prep, out: &mut Vec<String>) {
         match e {
             Expr::Term(Term::Iri(i)) => {
@@ -2042,7 +2393,11 @@ impl DatasetView {
                 // The union rule: default = own default ∪ every named.
                 let mut graphs: Vec<Option<String>> = vec![None];
                 graphs.extend(all_named.iter().map(|g| Some(g.clone())));
-                DatasetView { default_graphs: graphs, default_dedup: true, named: all_named }
+                DatasetView {
+                    default_graphs: graphs,
+                    default_dedup: true,
+                    named: all_named,
+                }
             }
             Some(ds) => {
                 let named = if !ds.named.is_empty() {
@@ -2056,12 +2411,13 @@ impl DatasetView {
                     if ds.default.is_empty() && !ds.named.is_empty() {
                         (vec![None], false)
                     } else {
-                        (
-                            ds.default.iter().map(|g| Some(g.clone())).collect(),
-                            true,
-                        )
+                        (ds.default.iter().map(|g| Some(g.clone())).collect(), true)
                     };
-                DatasetView { default_graphs, default_dedup, named }
+                DatasetView {
+                    default_graphs,
+                    default_dedup,
+                    named,
+                }
             }
         }
     }
@@ -2165,7 +2521,11 @@ impl<'a, S: QuadSource> Ev<'a, S> {
                 None => self.src.quads(g.as_deref()),
             };
             for q in quads {
-                let t = Triple { s: q.s, p: q.p, o: q.o };
+                let t = Triple {
+                    s: q.s,
+                    p: q.p,
+                    o: q.o,
+                };
                 if dedup {
                     if seen.insert(t.clone()) {
                         out.push(t);
@@ -2179,6 +2539,7 @@ impl<'a, S: QuadSource> Ev<'a, S> {
     }
 
     fn eval_group(&self, g: &Group, ctx: &Ctx, init: Binding) -> EvalResult<Vec<Binding>> {
+        check_deadline()?;
         let mut sols = vec![init];
         // SPARQL's rule: a FILTER speaks about its whole group, wherever
         // it is written in it. The other elements run in order; the
@@ -2190,6 +2551,7 @@ impl<'a, S: QuadSource> Ev<'a, S> {
             }
         }
         for el in &g.elements {
+            check_deadline()?;
             if matches!(el, Element::Filter(_)) {
                 continue;
             }
@@ -2205,7 +2567,11 @@ impl<'a, S: QuadSource> Ev<'a, S> {
                         match gt {
                             GraphTerm::Iri(name) => {
                                 if self.ds.named.iter().any(|n| n == name) {
-                                    next.extend(self.eval_group(inner, &Ctx::Named(name.clone()), sol)?);
+                                    next.extend(self.eval_group(
+                                        inner,
+                                        &Ctx::Named(name.clone()),
+                                        sol,
+                                    )?);
                                 }
                             }
                             GraphTerm::Var(v) => {
@@ -2220,7 +2586,11 @@ impl<'a, S: QuadSource> Ev<'a, S> {
                                         }
                                     };
                                     if bound {
-                                        next.extend(self.eval_group(inner, &Ctx::Named(name.clone()), s2)?);
+                                        next.extend(self.eval_group(
+                                            inner,
+                                            &Ctx::Named(name.clone()),
+                                            s2,
+                                        )?);
                                     }
                                 }
                             }
@@ -2320,6 +2690,12 @@ impl<'a, S: QuadSource> Ev<'a, S> {
         let mut first: Vec<Binding> = Vec::new();
         let mut seen: HashSet<BindingKey> = HashSet::new();
         for t in &triples {
+            // Cooperative deadline: stop matching; evaluate() re-checks
+            // after eval_group and turns the stop into an error, so a
+            // truncated match is never answered as if complete.
+            if check_deadline().is_err() {
+                return;
+            }
             if let Some(extended) = self.match_pattern(pat, t, sol) {
                 if seen.insert(BindingKey::canonical(&extended)) {
                     first.push(extended);
@@ -2401,7 +2777,10 @@ impl<'a, S: QuadSource> Ev<'a, S> {
 
     fn eval_expr(&self, e: &Expr, sol: &Binding, ctx: &Ctx) -> EvalResult<Term> {
         match e {
-            Expr::Var(v) => sol.get(v).cloned().ok_or_else(|| EvalError(format!("unbound variable ?{v}"))),
+            Expr::Var(v) => sol
+                .get(v)
+                .cloned()
+                .ok_or_else(|| EvalError(format!("unbound variable ?{v}"))),
             Expr::Term(t) => Ok(t.clone()),
             Expr::Not(a) => {
                 let v = self.eval_expr(a, sol, ctx)?;
@@ -2459,7 +2838,9 @@ impl<'a, S: QuadSource> Ev<'a, S> {
                     _ => a.contains(&b),
                 }))
             }
-            "LCASE" => Ok(Term::Literal(Literal::simple(&str_of(&arg(0)?)?.to_lowercase()))),
+            "LCASE" => Ok(Term::Literal(Literal::simple(
+                &str_of(&arg(0)?)?.to_lowercase(),
+            ))),
             "DATATYPE" => {
                 let t = arg(0)?;
                 match t {
@@ -2483,9 +2864,13 @@ impl<'a, S: QuadSource> Ev<'a, S> {
             "REGEX" => {
                 let text = str_of(&arg(0)?)?;
                 let pattern = str_of(&arg(1)?)?;
-                let flags = if args.len() > 2 { str_of(&arg(2)?)? } else { String::new() };
-                let found = regex_search(&pattern, &text, flags.contains('i'))
-                    .map_err(EvalError)?;
+                let flags = if args.len() > 2 {
+                    str_of(&arg(2)?)?
+                } else {
+                    String::new()
+                };
+                let found =
+                    regex_search(&pattern, &text, flags.contains('i')).map_err(EvalError)?;
                 Ok(bool_term(found))
             }
             _ => Err(EvalError(format!("function {name} is not evaluated"))),
@@ -2494,7 +2879,10 @@ impl<'a, S: QuadSource> Ev<'a, S> {
 
     /// Projection, grouping, ordering, slicing — the solution modifiers.
     fn project(&self, q: &Query, sols: Vec<Binding>) -> EvalResult<(Vec<String>, Vec<Binding>)> {
-        let has_agg = q.projection.iter().any(|p| matches!(p, ProjItem::Alias(e, _) if has_agg(e)))
+        let has_agg = q
+            .projection
+            .iter()
+            .any(|p| matches!(p, ProjItem::Alias(e, _) if has_agg(e)))
             || q.order_by.iter().any(|k| has_agg(&k.expr));
         let grouped = !q.group_by.is_empty() || has_agg;
         // Each unit: the binding order keys and aliases read from, and the
@@ -2632,10 +3020,15 @@ impl<'a, S: QuadSource> Ev<'a, S> {
             // group's members, which `full` no longer holds; the alias
             // path covers the issued queries (ORDER BY DESC(?n)).
             if let Expr::Var(v) = e {
-                return full.get(v).cloned().ok_or_else(|| EvalError("order key unbound".into()));
+                return full
+                    .get(v)
+                    .cloned()
+                    .ok_or_else(|| EvalError("order key unbound".into()));
             }
             if let Expr::Agg(_) = e {
-                return Err(EvalError("a bare aggregate ORDER BY key is unsupported".into()));
+                return Err(EvalError(
+                    "a bare aggregate ORDER BY key is unsupported".into(),
+                ));
             }
         }
         self.eval_expr(e, full, &Ctx::Default)
@@ -2706,7 +3099,8 @@ impl<'a, S: QuadSource> Ev<'a, S> {
                             Some(b) => {
                                 let ord = term_cmp(&t, &b);
                                 if (matches!(a, Agg::Min(_)) && ord == std::cmp::Ordering::Less)
-                                    || (matches!(a, Agg::Max(_)) && ord == std::cmp::Ordering::Greater)
+                                    || (matches!(a, Agg::Max(_))
+                                        && ord == std::cmp::Ordering::Greater)
                                 {
                                     t
                                 } else {
@@ -2733,7 +3127,10 @@ fn has_agg(e: &Expr) -> bool {
 }
 
 pub fn bool_term(b: bool) -> Term {
-    Term::Literal(Literal::typed(if b { "true" } else { "false" }, XSD_BOOLEAN))
+    Term::Literal(Literal::typed(
+        if b { "true" } else { "false" },
+        XSD_BOOLEAN,
+    ))
 }
 
 pub fn int_term(n: i64) -> Term {
@@ -2742,9 +3139,10 @@ pub fn int_term(n: i64) -> Term {
 
 fn num_of(t: &Term) -> EvalResult<f64> {
     match t {
-        Term::Literal(l) if l.is_numeric() => {
-            l.value.parse().map_err(|_| EvalError("not a number".into()))
-        }
+        Term::Literal(l) if l.is_numeric() => l
+            .value
+            .parse()
+            .map_err(|_| EvalError("not a number".into())),
         _ => Err(EvalError("not a number".into())),
     }
 }
@@ -2788,7 +3186,10 @@ fn compare(op: CmpOp, x: &Term, y: &Term) -> EvalResult<bool> {
             }
         }
         (Term::Literal(a), Term::Literal(b))
-            if a.datatype.is_none() && b.datatype.is_none() && a.lang.is_none() && b.lang.is_none() =>
+            if a.datatype.is_none()
+                && b.datatype.is_none()
+                && a.lang.is_none()
+                && b.lang.is_none() =>
         {
             a.value.cmp(&b.value)
         }
@@ -2841,12 +3242,19 @@ enum Re {
     Empty,
     Char(char),
     Any,
-    Class { neg: bool, items: Vec<ClassItem> },
+    Class {
+        neg: bool,
+        items: Vec<ClassItem>,
+    },
     Start,
     End,
     Concat(Vec<Re>),
     Alt(Vec<Re>),
-    Repeat { node: Box<Re>, min: u32, max: Option<u32> },
+    Repeat {
+        node: Box<Re>,
+        min: u32,
+        max: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2872,7 +3280,11 @@ pub fn regex_search(pattern: &str, text: &str, ci: bool) -> Result<bool, String>
     let mut p = ReParser { cs: pat, at: 0 };
     let re = p.parse_alt()?;
     if p.at != p.cs.len() {
-        return Err(format!("regex: unexpected {:?} at {}", p.cs.get(p.at), p.at));
+        return Err(format!(
+            "regex: unexpected {:?} at {}",
+            p.cs.get(p.at),
+            p.at
+        ));
     }
     let mut budget = 400_000usize;
     for start in 0..=txt.len() {
@@ -2881,7 +3293,7 @@ pub fn regex_search(pattern: &str, text: &str, ci: bool) -> Result<bool, String>
         }
         if budget == 0 {
             return Err("regex: step budget spent".into());
-    }
+        }
     }
     Ok(false)
 }
@@ -2923,15 +3335,27 @@ impl ReParser {
             match self.peek() {
                 Some('*') => {
                     self.at += 1;
-                    node = Re::Repeat { node: Box::new(node), min: 0, max: None };
+                    node = Re::Repeat {
+                        node: Box::new(node),
+                        min: 0,
+                        max: None,
+                    };
                 }
                 Some('+') => {
                     self.at += 1;
-                    node = Re::Repeat { node: Box::new(node), min: 1, max: None };
+                    node = Re::Repeat {
+                        node: Box::new(node),
+                        min: 1,
+                        max: None,
+                    };
                 }
                 Some('?') => {
                     self.at += 1;
-                    node = Re::Repeat { node: Box::new(node), min: 0, max: Some(1) };
+                    node = Re::Repeat {
+                        node: Box::new(node),
+                        min: 0,
+                        max: Some(1),
+                    };
                 }
                 Some('{') => {
                     let save = self.at;
@@ -2959,7 +3383,11 @@ impl ReParser {
                     if ok && self.peek() == Some('}') {
                         self.at += 1;
                         let min: u32 = min.parse().map_err(|_| "regex: bad {n,m}")?;
-                        node = Re::Repeat { node: Box::new(node), min, max };
+                        node = Re::Repeat {
+                            node: Box::new(node),
+                            min,
+                            max,
+                        };
                     } else {
                         self.at = save;
                         break;
@@ -3073,12 +3501,48 @@ impl ReParser {
         self.at += 1;
         let lit = |ch: char| (Re::Char(ch), ClassItem::Ch(ch));
         Ok(match c {
-            'd' => (Re::Class { neg: false, items: vec![ClassItem::Digit(false)] }, ClassItem::Digit(false)),
-            'D' => (Re::Class { neg: false, items: vec![ClassItem::Digit(true)] }, ClassItem::Digit(true)),
-            'w' => (Re::Class { neg: false, items: vec![ClassItem::Word(false)] }, ClassItem::Word(false)),
-            'W' => (Re::Class { neg: false, items: vec![ClassItem::Word(true)] }, ClassItem::Word(true)),
-            's' => (Re::Class { neg: false, items: vec![ClassItem::Space(false)] }, ClassItem::Space(false)),
-            'S' => (Re::Class { neg: false, items: vec![ClassItem::Space(true)] }, ClassItem::Space(true)),
+            'd' => (
+                Re::Class {
+                    neg: false,
+                    items: vec![ClassItem::Digit(false)],
+                },
+                ClassItem::Digit(false),
+            ),
+            'D' => (
+                Re::Class {
+                    neg: false,
+                    items: vec![ClassItem::Digit(true)],
+                },
+                ClassItem::Digit(true),
+            ),
+            'w' => (
+                Re::Class {
+                    neg: false,
+                    items: vec![ClassItem::Word(false)],
+                },
+                ClassItem::Word(false),
+            ),
+            'W' => (
+                Re::Class {
+                    neg: false,
+                    items: vec![ClassItem::Word(true)],
+                },
+                ClassItem::Word(true),
+            ),
+            's' => (
+                Re::Class {
+                    neg: false,
+                    items: vec![ClassItem::Space(false)],
+                },
+                ClassItem::Space(false),
+            ),
+            'S' => (
+                Re::Class {
+                    neg: false,
+                    items: vec![ClassItem::Space(true)],
+                },
+                ClassItem::Space(true),
+            ),
             'n' => lit('\n'),
             'r' => lit('\r'),
             't' => lit('\t'),
@@ -3099,7 +3563,12 @@ fn class_has(items: &[ClassItem], neg: bool, c: char) -> bool {
 }
 
 /// Every end position `re` can reach from `pos` in `text`.
-fn re_match(re: &Re, text: &[char], pos: usize, budget: &mut usize) -> Result<HashSet<usize>, String> {
+fn re_match(
+    re: &Re,
+    text: &[char],
+    pos: usize,
+    budget: &mut usize,
+) -> Result<HashSet<usize>, String> {
     if *budget == 0 {
         return Err("regex: step budget spent".into());
     }
@@ -3302,7 +3771,10 @@ mod tests {
     #[test]
     fn a_query_with_no_graph_sees_every_graph() {
         let s = outside_data();
-        assert_eq!(rows(&s, &format!("{P} SELECT ?t WHERE {{ ?t a ravel:Turn }}")).len(), 2);
+        assert_eq!(
+            rows(&s, &format!("{P} SELECT ?t WHERE {{ ?t a ravel:Turn }}")).len(),
+            2
+        );
     }
 
     #[test]
@@ -3324,7 +3796,8 @@ mod tests {
         let s = outside_data();
         let q = format!("{P} SELECT ?r WHERE {{ <ravel/Turn/t1> ravel:role ?r }}");
         assert_eq!(rows(&s, &q).len(), 1);
-        let q = format!("{P} SELECT ?t WHERE {{ GRAPH <ravel/NamedGraph/b> {{ ?t a ravel:Turn }} }}");
+        let q =
+            format!("{P} SELECT ?t WHERE {{ GRAPH <ravel/NamedGraph/b> {{ ?t a ravel:Turn }} }}");
         assert_eq!(rows(&s, &q).len(), 1);
     }
 
@@ -3341,7 +3814,10 @@ mod tests {
         let q = format!("{P} SELECT ?g ?t WHERE {{ GRAPH ?g {{ ?t a subtexture:Thing }} }}");
         let rs = rows(&s, &q);
         assert_eq!(rs.len(), 3);
-        assert!(rs.iter().all(|r| r.get("g").is_some()), "a row lost its graph");
+        assert!(
+            rs.iter().all(|r| r.get("g").is_some()),
+            "a row lost its graph"
+        );
     }
 
     /// The §5.3 crafted probe's data: ONE subject typed both stored
@@ -3447,7 +3923,8 @@ mod tests {
         assert_eq!(s.quads.len(), 1);
         assert_eq!(s.graph_names(), vec!["http://ex.org/g".to_string()]);
         // A triple line (no graph) parses to the default graph.
-        s.push_nt_line("<http://ex.org/a> <http://ex.org/name> \"Alice\" .").unwrap();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/name> \"Alice\" .")
+            .unwrap();
         assert_eq!(s.quads.len(), 2);
         assert!(s.remove_nt_line(line).unwrap());
         assert_eq!(s.quads.len(), 1);
@@ -3498,8 +3975,18 @@ mod tests {
         s.push(g, turn.clone(), iri(RDF_TYPE), iri(&format!("{R}Turn")));
         s.push(g, turn.clone(), iri(&format!("{R}turnId")), lit("e1"));
         s.push(g, turn.clone(), iri(&format!("{R}role")), lit("assistant"));
-        s.push(g, turn.clone(), iri(&format!("{R}timestamp")), dt("2026-07-01T00:00:00Z"));
-        s.push(g, turn.clone(), iri(&format!("{R}text")), lit("[ME|🧠]~[CONTENT|💻]~[YOU|🎓]"));
+        s.push(
+            g,
+            turn.clone(),
+            iri(&format!("{R}timestamp")),
+            dt("2026-07-01T00:00:00Z"),
+        );
+        s.push(
+            g,
+            turn.clone(),
+            iri(&format!("{R}text")),
+            lit("[ME|🧠]~[CONTENT|💻]~[YOU|🎓]"),
+        );
         let ann = iri("https://repolex.ai/ravel/Annotation/0123456789abcdef");
         let claim = iri("https://repolex.ai/ravel/Claim/0123456789abcdef");
         let body = iri("https://repolex.ai/ravel/Annotation/0123456789abcdef/body");
@@ -3508,12 +3995,42 @@ mod tests {
             p: iri(&format!("{R}exhibits")),
             o: lit("emojikey/harvest"),
         }));
-        s.push(g, claim.clone(), iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies"), prop);
-        s.push(g, claim.clone(), iri("http://www.w3.org/ns/prov#wasDerivedFrom"), ann.clone());
-        s.push(g, claim.clone(), iri(&format!("{R}detectorName")), lit("emojikey"));
-        s.push(g, ann.clone(), iri("http://www.w3.org/ns/oa#hasBody"), body.clone());
-        s.push(g, ann.clone(), iri(&format!("{R}textOrigin")), lit("authored"));
-        s.push(g, ann.clone(), iri("http://www.w3.org/ns/prov#generatedAtTime"), dt("2026-07-01T00:00:00Z"));
+        s.push(
+            g,
+            claim.clone(),
+            iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies"),
+            prop,
+        );
+        s.push(
+            g,
+            claim.clone(),
+            iri("http://www.w3.org/ns/prov#wasDerivedFrom"),
+            ann.clone(),
+        );
+        s.push(
+            g,
+            claim.clone(),
+            iri(&format!("{R}detectorName")),
+            lit("emojikey"),
+        );
+        s.push(
+            g,
+            ann.clone(),
+            iri("http://www.w3.org/ns/oa#hasBody"),
+            body.clone(),
+        );
+        s.push(
+            g,
+            ann.clone(),
+            iri(&format!("{R}textOrigin")),
+            lit("authored"),
+        );
+        s.push(
+            g,
+            ann.clone(),
+            iri("http://www.w3.org/ns/prov#generatedAtTime"),
+            dt("2026-07-01T00:00:00Z"),
+        );
         s.push(g, body.clone(), iri(&format!("{R}sig_me")), lit("🧠"));
         s.push(g, body.clone(), iri(&format!("{R}sig_content")), lit("💻"));
         s.push(g, body.clone(), iri(&format!("{R}sig_you")), lit("🎓"));
@@ -3565,8 +4082,14 @@ mod tests {
             assert_eq!(rs.len(), 1, "{q}");
             val(&rs[0], "n")
         };
-        assert_eq!(one("SELECT (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"), "5");
-        assert_eq!(one("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"), "3");
+        assert_eq!(
+            one("SELECT (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"),
+            "5"
+        );
+        assert_eq!(
+            one("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"),
+            "3"
+        );
         let turns = format!(
             "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?p ?o }} FILTER(STRSTARTS(STR(?s), \"https://repolex.ai/ravel/Turn/\")) }}"
         );
@@ -3599,7 +4122,8 @@ mod tests {
     fn dated_counts_and_min_max_read_datetimes() {
         let s = emoji_data();
         let dtf = "FILTER(DATATYPE(?t) = <http://www.w3.org/2001/XMLSchema#dateTime>)";
-        let q = format!("SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?ts ?t }} {dtf} }}");
+        let q =
+            format!("SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?ts ?t }} {dtf} }}");
         assert_eq!(one_on(&s, &q), "2");
         let q = format!("SELECT (MIN(?t) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?p ?t }} {dtf} }}");
         assert_eq!(one_on(&s, &q), "2026-07-01T00:00:00Z");
@@ -3615,8 +4139,18 @@ mod tests {
             ("g2", "c", "2026-01-02T00:00:00Z"),
         ] {
             let t = iri(&format!("https://repolex.ai/ravel/Turn/{id}"));
-            s.push(Some(&format!("https://repolex.ai/ravel/NamedGraph/{g}")), t.clone(), iri(RDF_TYPE), iri(&format!("{R}Turn")));
-            s.push(Some(&format!("https://repolex.ai/ravel/NamedGraph/{g}")), t, iri(&format!("{R}timestamp")), dt(ts));
+            s.push(
+                Some(&format!("https://repolex.ai/ravel/NamedGraph/{g}")),
+                t.clone(),
+                iri(RDF_TYPE),
+                iri(&format!("{R}Turn")),
+            );
+            s.push(
+                Some(&format!("https://repolex.ai/ravel/NamedGraph/{g}")),
+                t,
+                iri(&format!("{R}timestamp")),
+                dt(ts),
+            );
         }
         let q = format!(
             "SELECT ?t ?ts WHERE {{ GRAPH ?g {{ ?t a <{R}Turn> ; <{R}timestamp> ?ts }} }} ORDER BY DESC(?ts) LIMIT 2"
@@ -3633,7 +4167,12 @@ mod tests {
         // §2.2's ontology-consistency ASK: true when the ontology is in
         // the default graph (the class IRI a subject), false otherwise.
         let mut onto = VecSource::new();
-        onto.push(None, iri(&format!("{R}Turn")), iri(RDF_TYPE), iri("http://www.w3.org/2002/07/owl#Class"));
+        onto.push(
+            None,
+            iri(&format!("{R}Turn")),
+            iri(RDF_TYPE),
+            iri("http://www.w3.org/2002/07/owl#Class"),
+        );
         let q = format!("ASK {{ <{R}Turn> a ?k }}");
         match run(&onto, &q).results {
             Results::Boolean(b) => assert!(b),
@@ -3702,14 +4241,39 @@ mod tests {
         s.push(g, note.clone(), iri(RDF_TYPE), iri(&format!("{R}Memory")));
         s.push(g, note.clone(), iri(&format!("{R}memoryLevel")), int(0));
         s.push(g, note.clone(), iri(&format!("{R}logStart")), int(0));
-        s.push(g, note.clone(), iri(&format!("{R}windowStart")), dt("2026-07-01T00:00:00Z"));
-        s.push(g, note.clone(), iri(&format!("{R}memoryText")), lit("the GOAT ate Cake at dawn"));
-        s.push(g, note.clone(), iri(&format!("{R}relatedToId")), iri("https://repolex.ai/ravel/Turn/e1"));
+        s.push(
+            g,
+            note.clone(),
+            iri(&format!("{R}windowStart")),
+            dt("2026-07-01T00:00:00Z"),
+        );
+        s.push(
+            g,
+            note.clone(),
+            iri(&format!("{R}memoryText")),
+            lit("the GOAT ate Cake at dawn"),
+        );
+        s.push(
+            g,
+            note.clone(),
+            iri(&format!("{R}relatedToId")),
+            iri("https://repolex.ai/ravel/Turn/e1"),
+        );
         let tg = Some("https://repolex.ai/ravel/NamedGraph/sess-A");
         let turn = iri("https://repolex.ai/ravel/Turn/e1");
         s.push(tg, turn.clone(), iri(RDF_TYPE), iri(&format!("{R}Turn")));
-        s.push(tg, turn.clone(), iri(&format!("{R}timestamp")), dt("2026-07-01T00:00:00Z"));
-        s.push(tg, turn, iri(&format!("{R}text")), lit("the GOAT ate Cake at dawn, said the transcript"));
+        s.push(
+            tg,
+            turn.clone(),
+            iri(&format!("{R}timestamp")),
+            dt("2026-07-01T00:00:00Z"),
+        );
+        s.push(
+            tg,
+            turn,
+            iri(&format!("{R}text")),
+            lit("the GOAT ate Cake at dawn, said the transcript"),
+        );
         s
     }
 
@@ -3761,19 +4325,46 @@ mod tests {
     #[test]
     fn out_of_subset_constructs_refuse_by_name() {
         let cases: &[(&str, &str)] = &[
-            ("SELECT ?s WHERE { ?s ?p ?o . { ?s ?p ?o } UNION { ?s ?p ?o } }", "UNION"),
-            ("SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } } }", "subqueries"),
+            (
+                "SELECT ?s WHERE { ?s ?p ?o . { ?s ?p ?o } UNION { ?s ?p ?o } }",
+                "UNION",
+            ),
+            (
+                "SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } } }",
+                "subqueries",
+            ),
             ("SELECT ?s WHERE { ?s ?p ?o MINUS { ?s ?p ?x } }", "MINUS"),
-            ("SELECT ?s WHERE { ?s ?p ?o } GROUP BY ?s HAVING(?s > 1)", "HAVING"),
+            (
+                "SELECT ?s WHERE { ?s ?p ?o } GROUP BY ?s HAVING(?s > 1)",
+                "HAVING",
+            ),
             ("SELECT REDUCED ?s WHERE { ?s ?p ?o }", "SELECT REDUCED"),
-            ("SELECT ?s WHERE { SERVICE <https://x/> { ?s ?p ?o } }", "SERVICE"),
-            ("SELECT ?s WHERE { ?s <https://x/p>/<https://x/q> ?o }", "property paths"),
+            (
+                "SELECT ?s WHERE { SERVICE <https://x/> { ?s ?p ?o } }",
+                "SERVICE",
+            ),
+            (
+                "SELECT ?s WHERE { ?s <https://x/p>/<https://x/q> ?o }",
+                "property paths",
+            ),
             ("SELECT ?s WHERE { ?s ^<https://x/p> ?o }", "property paths"),
             ("SELECT ?s WHERE { ?s <https://x/p>+ ?o }", "property paths"),
-            ("SELECT ?s WHERE { ?s ?p ?o FILTER(CONCAT(?s, \"x\") = \"y\") }", "function CONCAT"),
-            ("SELECT ?s WHERE { ?s ?p ?o FILTER(?o + 1 > 2) }", "arithmetic expressions"),
-            ("SELECT ?s WHERE { ?s ?p ?o FILTER(?p IN (<https://x/a>)) }", "IN"),
-            ("INSERT DATA { <https://x/a> <https://x/b> <https://x/c> }", "SPARQL Update"),
+            (
+                "SELECT ?s WHERE { ?s ?p ?o FILTER(CONCAT(?s, \"x\") = \"y\") }",
+                "function CONCAT",
+            ),
+            (
+                "SELECT ?s WHERE { ?s ?p ?o FILTER(?o + 1 > 2) }",
+                "arithmetic expressions",
+            ),
+            (
+                "SELECT ?s WHERE { ?s ?p ?o FILTER(?p IN (<https://x/a>)) }",
+                "IN",
+            ),
+            (
+                "INSERT DATA { <https://x/a> <https://x/b> <https://x/c> }",
+                "SPARQL Update",
+            ),
             ("SELECT ?s WHERE { ?s ?p [ ?q ?o ] }", "blank nodes"),
         ];
         for (q, want) in cases {
@@ -3803,7 +4394,9 @@ mod tests {
         match run(&s, q).results {
             Results::Triples(ts) => {
                 assert_eq!(ts.len(), 2, "{ts:?}");
-                assert!(ts.iter().all(|t| t.s == iri("https://repolex.ai/ravel/Turn/t1")));
+                assert!(ts
+                    .iter()
+                    .all(|t| t.s == iri("https://repolex.ai/ravel/Turn/t1")));
             }
             other => panic!("{other:?}"),
         }
@@ -3824,8 +4417,15 @@ mod tests {
             &format!("{P} SELECT ?r ?short WHERE {{ <ravel/Turn/t1> ravel:role ?r . BIND(SUBSTR(?r, 1, 2) AS ?short) FILTER(?r != \"admin\") }}"),
         );
         assert_eq!(val(&rs[0], "short"), "us");
-        let rs = rows(&emoji_data(), &format!("{P} SELECT ?b WHERE {{ ?b ravel:sig_me ?m FILTER(?m < \"🎓\") }}"));
-        assert_eq!(rs.len(), 0, "lexical < on plain strings: 🧠 (U+1F9E0) is not < 🎓 (U+1F393)");
+        let rs = rows(
+            &emoji_data(),
+            &format!("{P} SELECT ?b WHERE {{ ?b ravel:sig_me ?m FILTER(?m < \"🎓\") }}"),
+        );
+        assert_eq!(
+            rs.len(),
+            0,
+            "lexical < on plain strings: 🧠 (U+1F9E0) is not < 🎓 (U+1F393)"
+        );
     }
 
     #[test]
@@ -3848,7 +4448,12 @@ mod tests {
 
     #[test]
     fn regex_engine_basics() {
-        assert!(regex_search("(^|[^A-Za-z0-9_])cake($|[^A-Za-z0-9_])", "the Cake, yes", true).unwrap());
+        assert!(regex_search(
+            "(^|[^A-Za-z0-9_])cake($|[^A-Za-z0-9_])",
+            "the Cake, yes",
+            true
+        )
+        .unwrap());
         assert!(!regex_search("(^|[^A-Za-z0-9_])cake($|[^A-Za-z0-9_])", "cupcake", true).unwrap());
         assert!(regex_search("^a.c$", "abc", false).unwrap());
         assert!(!regex_search("^a.c$", "a\nc", false).unwrap());
@@ -3859,7 +4464,10 @@ mod tests {
 
     #[test]
     fn instants_order_across_zones() {
-        assert!(parse_instant("2026-01-01T01:00:00+01:00") < parse_instant("2026-01-01T00:00:01Z").map(|x| x + 3_600_000));
+        assert!(
+            parse_instant("2026-01-01T01:00:00+01:00")
+                < parse_instant("2026-01-01T00:00:01Z").map(|x| x + 3_600_000)
+        );
         assert_eq!(
             parse_instant("2026-01-01T01:00:00+01:00"),
             parse_instant("2026-01-01T00:00:00Z")
@@ -3872,10 +4480,14 @@ mod tests {
         // spread of term sets, quads_matching returns exactly the
         // full-listing filter, in the same order, per graph.
         let mut s = VecSource::new();
-        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" .").unwrap();
-        s.push_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .").unwrap();
-        s.push_nt_line("<http://ex.org/a> <http://ex.org/q> <http://ex.org/b> .").unwrap();
-        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" <http://ex.org/g> .").unwrap();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" .")
+            .unwrap();
+        s.push_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .")
+            .unwrap();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/q> <http://ex.org/b> .")
+            .unwrap();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" <http://ex.org/g> .")
+            .unwrap();
         let terms = [
             Term::iri("http://ex.org/a"),
             Term::iri("http://ex.org/b"),
@@ -3891,7 +4503,11 @@ mod tests {
                         .into_iter()
                         .filter(|q| term_at(q, pos) == t)
                         .collect();
-                    assert_eq!(s.quads_matching(g, pos, std::slice::from_ref(t)), want, "{pos:?} {t:?} {g:?}");
+                    assert_eq!(
+                        s.quads_matching(g, pos, std::slice::from_ref(t)),
+                        want,
+                        "{pos:?} {t:?} {g:?}"
+                    );
                 }
             }
             // A multi-term set (the prep-expansion shape) also agrees.
@@ -3909,20 +4525,33 @@ mod tests {
     #[test]
     fn indexes_stay_exact_across_remove() {
         let mut s = VecSource::new();
-        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" <http://ex.org/g> .").unwrap();
-        s.push_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .").unwrap();
-        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" .").unwrap();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" <http://ex.org/g> .")
+            .unwrap();
+        s.push_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .")
+            .unwrap();
+        s.push_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" .")
+            .unwrap();
         // Remove one of the two graphs' <a> statements; the rebuild
         // must drop exactly it from every index and the graph census.
-        assert!(s.remove_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" <http://ex.org/g> .").unwrap());
+        assert!(s
+            .remove_nt_line("<http://ex.org/a> <http://ex.org/p> \"1\" <http://ex.org/g> .")
+            .unwrap());
         assert_eq!(s.quads.len(), 2);
         let a = Term::iri("http://ex.org/a");
         assert_eq!(s.quads_matching(None, Pos::Subject, &[a.clone()]).len(), 1);
-        assert_eq!(s.quads_matching(Some("http://ex.org/g"), Pos::Subject, &[a]).len(), 0);
+        assert_eq!(
+            s.quads_matching(Some("http://ex.org/g"), Pos::Subject, &[a])
+                .len(),
+            0
+        );
         assert_eq!(s.graph_names(), vec!["http://ex.org/g".to_string()]);
         // Removing the last quad of a graph removes the graph.
-        assert!(s.remove_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .").unwrap());
+        assert!(s
+            .remove_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .")
+            .unwrap());
         assert!(s.graph_names().is_empty());
-        assert!(!s.remove_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .").unwrap());
+        assert!(!s
+            .remove_nt_line("<http://ex.org/b> <http://ex.org/p> \"2\" <http://ex.org/g> .")
+            .unwrap());
     }
 }

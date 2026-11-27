@@ -22,7 +22,6 @@ pub use memory::run_memory_loop;
 
 use crate::sync::{self, SyncStats};
 use anyhow::{anyhow, Result};
-use chrono::Local;
 use config::DaemonConfig;
 use registry::Soul;
 use serde::Serialize;
@@ -117,7 +116,7 @@ pub struct Daemon {
     memory_dirty: Mutex<std::collections::HashSet<String>>,
     /// The machine's key list, grants and owner (`~/.lex/identity/`), read
     /// through tessera. Checked on every request by `gate`.
-    pub keys: tessera::HostKeys,
+    pub keys: crate::tessera::HostKeys,
 }
 
 /// Where git-lex keeps this machine's identity records.
@@ -130,7 +129,7 @@ pub fn identity_dir() -> std::path::PathBuf {
 pub fn log(msg: impl AsRef<str>) {
     eprintln!(
         "{} raveld {}",
-        Local::now().format("%Y-%m-%d %H:%M:%S"),
+        crate::time::now_local_format("%Y-%m-%d %H:%M:%S"),
         msg.as_ref()
     );
 }
@@ -156,7 +155,7 @@ impl Daemon {
             stopping: std::sync::atomic::AtomicBool::new(false),
             memory: Mutex::new(memory::MemoryState::default()),
             memory_dirty: Mutex::new(dirty),
-            keys: tessera::HostKeys::new(identity_dir().join("jwks.json")),
+            keys: crate::tessera::HostKeys::new(identity_dir().join("jwks.json")),
         })
     }
 
@@ -268,7 +267,7 @@ impl Daemon {
         let mut m = self.state.lock().map_err(|_| anyhow!("state poisoned"))?;
         let st = m.entry(soul.id.clone()).or_default();
         st.passes += 1;
-        st.last_sync = Some(Local::now().to_rfc3339());
+        st.last_sync = Some(crate::time::now_local_rfc3339());
         match &res {
             Ok(stats) => {
                 st.last_error = None;

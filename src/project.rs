@@ -1,13 +1,13 @@
-//! Project generic `Event`s into an oxigraph Store as RDF 1.2.
+//! Project generic `Event`s into the phext graph store as RDF 1.2.
 //!
 //! Subject URNs are partition-scoped: `<partition><event_id>` where the adapter
 //! supplies `partition` (for the soul adapter, `https://repolex.ai/ravel/Turn/`,
 //! carrying no soul identity — soul scoping is the store). The engine
 //! treats `partition` as an opaque prefix — it does not know it means "soul".
 
+use crate::graph::Store;
 use crate::{Event, Wrote, RAVEL_NS};
 use anyhow::Result;
-use oxigraph::store::Store;
 
 /// Build the subject IRI for an event under a partition.
 pub fn event_iri(partition: &str, event_id: &str) -> String {
@@ -70,10 +70,7 @@ impl Who {
 /// when the record names no one; a model is never guessed.
 fn author(e: &Event, who: &Who, claim: Option<&crate::herdr::SenderClaim>) -> Option<String> {
     if let Some(c) = claim {
-        return c
-            .user
-            .clone()
-            .filter(|u| crate::names::plain_username(u));
+        return c.user.clone().filter(|u| crate::names::plain_username(u));
     }
     match e.wrote {
         Wrote::Soul => {
@@ -84,7 +81,13 @@ fn author(e: &Event, who: &Who, claim: Option<&crate::herdr::SenderClaim>) -> Op
             })
         }
         // A peer's message with no sender line names no one we can state.
-        Wrote::Person if e.text.as_deref().is_some_and(crate::herdr::unsigned_peer_line) => None,
+        Wrote::Person
+            if e.text
+                .as_deref()
+                .is_some_and(crate::herdr::unsigned_peer_line) =>
+        {
+            None
+        }
         Wrote::Person => who.person.clone(),
         Wrote::Nobody => None,
     }
@@ -96,10 +99,7 @@ fn author(e: &Event, who: &Who, claim: Option<&crate::herdr::SenderClaim>) -> Op
 /// duplicates — the w4r3z idempotency discipline, at the triple level.
 pub fn project(events: &[Event], partition: &str) -> Result<Store> {
     let store = Store::new()?;
-    store.load_from_reader(
-        oxigraph::io::RdfFormat::NTriples,
-        project_nt(events, partition, &Who::default())?.as_bytes(),
-    )?;
+    store.load_nt(&project_nt(events, partition, &Who::default())?, None)?;
     Ok(store)
 }
 
@@ -204,9 +204,7 @@ mod tests {
     fn the_ontology_declares_every_turn_term_the_projection_emits() {
         let ttl = include_str!("../ontology/ravel/ravel.ttl");
         let store = Store::new().unwrap();
-        store
-            .load_from_reader(oxigraph::io::RdfFormat::Turtle, ttl.as_bytes())
-            .expect("ravel.ttl parses");
+        store.load_ttl(ttl, None).expect("ravel.ttl parses");
         let e = Event {
             event_id: "e1".into(),
             parent_id: Some("e0".into()),
@@ -236,7 +234,10 @@ mod tests {
             role: "assistant".into(),
             ..said.clone()
         };
-        let who = Who { soul: Some("spacegoat".into()), person: Some("goodlux".into()) };
+        let who = Who {
+            soul: Some("spacegoat".into()),
+            person: Some("goodlux".into()),
+        };
         let nt = project_nt(&[quoted], "urn:test:", &who).unwrap();
         assert!(!nt.contains("claimedSender"));
         let nt = project_nt(&[e, said], "urn:test:", &who).unwrap();
@@ -252,17 +253,15 @@ mod tests {
         assert!(
             terms.contains(&"author".to_string()) && terms.contains(&"modelSetting".to_string())
         );
-        assert!(!terms.contains(&"model".to_string()), "ravel:model is retired");
+        assert!(
+            !terms.contains(&"model".to_string()),
+            "ravel:model is retired"
+        );
         for t in terms {
             let q = format!("ASK {{ <{RAVEL_NS}{t}> a ?k }}");
             let ok = matches!(
-                oxigraph::sparql::SparqlEvaluator::new()
-                    .parse_query(&q)
-                    .unwrap()
-                    .on_store(&store)
-                    .execute()
-                    .unwrap(),
-                oxigraph::sparql::QueryResults::Boolean(true)
+                crate::graph::eval_query(&store, &q).unwrap(),
+                crate::graph::QueryResults::Boolean(true)
             );
             assert!(ok, "ravel:{t} is emitted but not declared in ravel.ttl");
         }
@@ -294,16 +293,37 @@ mod tests {
 
     #[test]
     fn an_author_names_the_soul_and_its_model_or_the_person_and_guesses_nothing() {
-        let who = Who { soul: Some("s3lk13".into()), person: Some("goodlux".into()) };
+        let who = Who {
+            soul: Some("s3lk13".into()),
+            person: Some("goodlux".into()),
+        };
         let events = [
-            turn("a", "assistant", "hi", Some("claude-fable-5-2"), Wrote::Soul),
+            turn(
+                "a",
+                "assistant",
+                "hi",
+                Some("claude-fable-5-2"),
+                Wrote::Soul,
+            ),
             turn("b", "assistant", "hi", None, Wrote::Soul),
             turn("c", "user", "fix it", None, Wrote::Person),
             turn("d", "user", "tool output", None, Wrote::Nobody),
             // A herdr line names its own user, whatever else the turn is.
-            turn("e", "user", "--herdr v=1 from=th34 pane=w9:p1 user=4m41th34--\nhello", None, Wrote::Person),
+            turn(
+                "e",
+                "user",
+                "--herdr v=1 from=th34 pane=w9:p1 user=4m41th34--\nhello",
+                None,
+                Wrote::Person,
+            ),
             // A sender line with no user names no one.
-            turn("f", "user", "--herdr v=1 from=th34 pane=w9:p1--\nhello", None, Wrote::Person),
+            turn(
+                "f",
+                "user",
+                "--herdr v=1 from=th34 pane=w9:p1--\nhello",
+                None,
+                Wrote::Person,
+            ),
         ];
         let nt = project_nt(&events, "urn:test:", &who).unwrap();
         assert_eq!(authors(&nt, "a"), ["s3lk13-on-claude-fable-5-2"]);
@@ -313,12 +333,18 @@ mod tests {
         assert_eq!(authors(&nt, "e"), ["4m41th34"]);
         assert!(authors(&nt, "f").is_empty());
         let peer = [turn("g", "user", "[kira] GREEN LIGHT", None, Wrote::Person)];
-        assert!(!project_nt(&peer, "urn:test:", &who).unwrap().contains("author>"));
+        assert!(!project_nt(&peer, "urn:test:", &who)
+            .unwrap()
+            .contains("author>"));
         assert!(!nt.contains(&format!("<{RAVEL_NS}model>")));
 
         // A store with no username, on a machine with no recorded owner.
         let nt = project_nt(&events, "urn:test:", &Who::default()).unwrap();
-        assert_eq!(nt.matches("author>").count(), 1, "only the herdr line still names someone");
+        assert_eq!(
+            nt.matches("author>").count(),
+            1,
+            "only the herdr line still names someone"
+        );
     }
 
     /// Real transcripts, read-only: how many turns each author gets, and a
@@ -327,22 +353,31 @@ mod tests {
     #[test]
     #[ignore]
     fn real_authors() {
-        let who = Who { soul: Some("soul".into()), person: Some("person".into()) };
+        let who = Who {
+            soul: Some("soul".into()),
+            person: Some("person".into()),
+        };
         let mut sets: Vec<(String, Vec<Event>)> = Vec::new();
         if let Ok(f) = std::env::var("RAVEL_TRIAL_FILE") {
-            let e = crate::adapter::parse_transcript(&std::fs::read_to_string(&f).unwrap()).unwrap();
+            let e =
+                crate::adapter::parse_transcript(&std::fs::read_to_string(&f).unwrap()).unwrap();
             sets.push((f, e));
         }
         if let Ok(f) = std::env::var("RAVEL_TRIAL_AGY") {
-            let e = crate::agy::parse_transcript(&std::fs::read_to_string(&f).unwrap(), "c").unwrap().events;
+            let e = crate::agy::parse_transcript(&std::fs::read_to_string(&f).unwrap(), "c")
+                .unwrap()
+                .events;
             sets.push((f, e));
         }
         for (f, events) in sets {
             let mut n: std::collections::BTreeMap<String, usize> = Default::default();
             let mut shown = 0;
             for e in &events {
-                let claim = (e.role == "user" || e.role == "USER_EXPLICIT").then(|| e.text.as_deref().and_then(crate::herdr::sender_claim)).flatten();
-                let a = author(e, &who, claim.as_ref()).unwrap_or_else(|| format!("(none, {})", e.role));
+                let claim = (e.role == "user" || e.role == "USER_EXPLICIT")
+                    .then(|| e.text.as_deref().and_then(crate::herdr::sender_claim))
+                    .flatten();
+                let a = author(e, &who, claim.as_ref())
+                    .unwrap_or_else(|| format!("(none, {})", e.role));
                 if a == "person" && shown < 12 {
                     shown += 1;
                     let t: String = e.text.as_deref().unwrap_or("").chars().take(90).collect();

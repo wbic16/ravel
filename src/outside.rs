@@ -1,26 +1,27 @@
 //! A query that arrives from outside: `ravel query` and raveld's query
 //! routes. It is prepared here before the store sees it.
 //!
-//! Three things happen, in calamus's order (parse, rewrite, evaluate):
+//! Three things happen, in the original pipeline's order (parse,
+//! rewrite, evaluate):
 //!
 //!   - it is parsed against a base, so a short address resolves;
-//!   - calamus rewrites it from the ontology, so a question asked in
-//!     `subtexture:` names finds what ravel stores under `ravel:` names;
-//!   - a query that names no dataset sees every graph in the store. ravel
-//!     keeps everything in named graphs, so without this the same question
-//!     that works in git-lex returns nothing here, with no error
-//!     (named-graph spec section 12: TranscriptGraph and MemoryGraph are
-//!     both under subtexture:DefaultGraph).
+//!   - the ontology rewrite is applied — as DATA, not as an algebra
+//!     rewrite: the phext evaluator takes the calamus Index's closure
+//!     as a `Prep` (equivalent/sub properties and classes, abstract
+//!     names dropped), derived from the two shipped ontologies by the
+//!     purpose-built Turtle reader in `crate::ttl`. This is the Rust
+//!     seat of the phext backend's `ontology_prep()` port (V2-REPORT:
+//!     13/13 outside shapes row-equal with the old calamus pipeline);
+//!   - a query that names no dataset sees every graph in the store —
+//!     the phext evaluator's dataset rule (named-graph spec section 12).
 //!
 //! ravel's own working queries never come through here. They name stored
-//! spellings and must not change, or slow down, when an ontology gains a
-//! name.
+//! spellings and must not change, or slow down, when an ontology gains
+//! a name.
 
+use crate::graph::{CancellationToken, QueryResults, Store};
 use anyhow::{anyhow, Result};
-use calamus::{Index, Options, Report};
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-use oxigraph::store::Store;
-use spargebra::{Query, SparqlParser};
+use phext_serve::sparql::{collect_left, parse_query, Prep, Query};
 use std::sync::OnceLock;
 
 // The base an outside query is read against is the root of the store being
@@ -28,62 +29,148 @@ use std::sync::OnceLock;
 // `<ravel/Turn/x>` and `GRAPH <ravel/NamedGraph/optmem>` mean that store's
 // own, and one saved query works on every soul.
 
-/// The prefix of the names no store holds; calamus drops them from answers.
+/// The prefix of the names no store holds; the rewrite drops them from
+/// answers.
 pub const ABSTRACT: &str = "https://repolex.ai/ontology/subtexture/";
 
 const SUBTEXTURE_TTL: &str = include_str!("../ontology/subtexture/subtexture.ttl");
 const RAVEL_TTL: &str = include_str!("../ontology/ravel/ravel.ttl");
 
-/// Built once, from the ontology alone, never from what a store holds.
-pub fn index() -> &'static Index {
-    static INDEX: OnceLock<Index> = OnceLock::new();
-    INDEX.get_or_init(|| {
-        Index::from_turtle(&[SUBTEXTURE_TTL, RAVEL_TTL], &[ABSTRACT])
-            .expect("the shipped ontologies parse; a test holds this")
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// The ontology preparation, built once from the shipped ontologies:
+/// the calamus closure as evaluator data (a faithful port of the phext
+/// backend's `ontology_prep()` / `_calamus_closure()`).
+pub fn prep() -> &'static Prep {
+    static PREP: OnceLock<Prep> = OnceLock::new();
+    PREP.get_or_init(|| {
+        use crate::ttl::{triples, TtlTerm};
+        let mut prefixes = std::collections::HashMap::from([
+            ("owl".to_string(), "http://www.w3.org/2002/07/owl#".to_string()),
+            ("rdfs".to_string(), "http://www.w3.org/2000/01/rdf-schema#".to_string()),
+        ]);
+        // (predicate, is_property, both_ways)
+        let edge_kinds: std::collections::HashMap<&str, (bool, bool)> =
+            std::collections::HashMap::from([
+                ("http://www.w3.org/2000/01/rdf-schema#subPropertyOf", (true, false)),
+                ("http://www.w3.org/2002/07/owl#equivalentProperty", (true, true)),
+                ("http://www.w3.org/2000/01/rdf-schema#subClassOf", (false, false)),
+                ("http://www.w3.org/2002/07/owl#equivalentClass", (false, true)),
+            ]);
+        let mut prop_edges: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            Default::default();
+        let mut class_edges: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            Default::default();
+        for text in [RAVEL_TTL, SUBTEXTURE_TTL] {
+            for (s, p, o) in triples(text, &mut prefixes) {
+                let (TtlTerm::Iri(s), TtlTerm::Iri(p), TtlTerm::Iri(o)) = (s, p, o) else {
+                    continue;
+                };
+                let Some(&(is_prop, both_ways)) = edge_kinds.get(p.as_str()) else {
+                    continue;
+                };
+                let edges = if is_prop { &mut prop_edges } else { &mut class_edges };
+                edges.entry(o.clone()).or_default().insert(s.clone());
+                edges.entry(s.clone()).or_default();
+                if both_ways {
+                    edges.entry(s).or_default().insert(o);
+                }
+            }
+        }
+        // calamus ontology.rs closure(): for every name, everything
+        // reachable from it (itself included), abstract names dropped,
+        // in address order. A name whose stored answer is only itself
+        // is left out (asked as written).
+        let closure =
+            |edges: &std::collections::HashMap<String, std::collections::HashSet<String>>| {
+                let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+                for start in edges.keys() {
+                    let mut seen: std::collections::HashSet<&str> = Default::default();
+                    let mut todo = vec![start.as_str()];
+                    while let Some(name) = todo.pop() {
+                        if seen.insert(name) {
+                            if let Some(next) = edges.get(name) {
+                                todo.extend(next.iter().map(String::as_str));
+                            }
+                        }
+                    }
+                    let mut stored: Vec<String> = seen
+                        .iter()
+                        .filter(|x| !x.starts_with(ABSTRACT))
+                        .map(|x| x.to_string())
+                        .collect();
+                    stored.sort();
+                    if stored.is_empty() || stored == vec![start.clone()] {
+                        continue;
+                    }
+                    out.insert(start.clone(), stored);
+                }
+                out
+            };
+        let mut prop_equiv = closure(&prop_edges);
+        prop_equiv.remove(RDF_TYPE); // calamus: rdf:type is never swapped
+        let class_subs = closure(&class_edges);
+        Prep {
+            prop_equiv,
+            class_subs,
+            abstract_prefixes: vec![ABSTRACT.to_string()],
+        }
     })
 }
 
-/// Parse and rewrite. Any error means the query is refused, never run
-/// half-prepared.
+/// What preparation found: the names inside expressions that have other
+/// stored spellings and were left as written (the old Report's
+/// `left_as_written`, computed by the evaluator's own collector).
+#[derive(Debug, Clone, Default)]
+pub struct Report {
+    pub left_as_written: Vec<String>,
+}
+
+/// Parse against `base` and compute the preparation. Any error means
+/// the query is refused, never run half-prepared. Out-of-subset
+/// constructs are refused BY NAME by the phext parser (the subset is
+/// the contract; see `phext/SPARQL-SUBSET.md`).
 pub fn prepare(text: &str, base: &str) -> Result<(Query, Report)> {
-    let mut query = SparqlParser::new()
-        .with_base_iri(base)
-        .map_err(|e| anyhow!("base {base}: {e}"))?
-        .parse_query(text)
-        .map_err(|e| anyhow!("{e}"))?;
-    // ravel keeps no ontology graph in a store, so nothing is exempt.
-    let report = calamus::rewrite(&mut query, index(), &Options::default())
-        .map_err(|e| anyhow!("rewrite: {e}"))?;
-    Ok((query, report))
+    let query = parse_query(text, base).map_err(|e| anyhow!("{}", e.message))?;
+    let mut left = Vec::new();
+    collect_left(&query, prep(), &mut left);
+    Ok((query, Report { left_as_written: left }))
 }
 
 /// Prepare and run. The results borrow nothing from the query.
-pub fn run<'a>(
-    store: &'a Store,
-    text: &str,
-    base: &str,
-) -> Result<(QueryResults<'a>, Report)> {
+pub fn run(store: &Store, text: &str, base: &str) -> Result<(QueryResults, Report)> {
     run_until(store, text, base, None)
 }
 
 /// [`run`], with a token the caller can use to stop the work part-way.
-pub fn run_until<'a>(
-    store: &'a Store,
+/// The token is the phext counterpart of the native evaluator's
+/// cancellation token: the evaluator's hot loops poll its flag
+/// cooperatively and stop with an error (see
+/// `phext_serve::sparql::evaluate_with_stop`). The daemon's 30 s seat
+/// policy cancels this token from its timer, and a caller hanging up
+/// cancels it on drop — both stop the work, as before.
+pub fn run_until(
+    store: &Store,
     text: &str,
     base: &str,
-    stop: Option<oxigraph::sparql::CancellationToken>,
-) -> Result<(QueryResults<'a>, Report)> {
-    let (query, report) = prepare(text, base)?;
-    let mut evaluator = SparqlEvaluator::new();
-    if let Some(stop) = stop {
-        evaluator = evaluator.with_cancellation_token(stop);
-    }
-    let mut prepared = evaluator.for_query(query);
-    // FROM / FROM NAMED written by the caller is kept as written.
-    if prepared.dataset().is_default_dataset() {
-        prepared.dataset_mut().set_default_graph_as_union();
-    }
-    Ok((prepared.on_store(store).execute()?, report))
+    stop: Option<CancellationToken>,
+) -> Result<(QueryResults, Report)> {
+    let (_query, report) = prepare(text, base)?;
+    let results = store.evaluate_union(text, base, prep(), None, stop.as_ref())?;
+    Ok((results, report))
+}
+
+/// Prepare and run with an explicit cooperative deadline (the other
+/// half of the native 30 s policy: a hard stop even if nobody cancels).
+pub fn run_deadline(
+    store: &Store,
+    text: &str,
+    base: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<(QueryResults, Report)> {
+    let (_query, report) = prepare(text, base)?;
+    let results = store.evaluate_union(text, base, prep(), deadline, None)?;
+    Ok((results, report))
 }
 
 /// What a caller should be told about names left as written, one line each.
@@ -104,7 +191,7 @@ pub fn notes(report: &Report) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxigraph::io::RdfFormat;
+    use crate::graph::{NamedNode, QueryResults};
 
     /// A writer and a reader over one store directory, as raveld runs them:
     /// the writer opens read-write, adds a turn, flushes and closes, again
@@ -131,8 +218,8 @@ mod tests {
                         .is_ok()
                         .then(|| crate::graph::writing(std::path::Path::new(&dir)));
                     let store = crate::graph::open(std::path::Path::new(&dir)).unwrap();
-                    let g = oxigraph::model::NamedNode::new(format!("{base}ravel/NamedGraph/trial")).unwrap();
-                    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let g = format!("{base}ravel/NamedGraph/trial");
+                    let ts = crate::time::Instant::now().to_rfc3339_millis_z();
                     let nt = format!(
                         "<{base}ravel/Turn/trial-{n}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://repolex.ai/ontology/ravel/Turn> .\n\
                          <{base}ravel/Turn/trial-{n}> <https://repolex.ai/ontology/ravel/timestamp> \"{ts}\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n\
@@ -141,8 +228,7 @@ mod tests {
                          <{base}ravel/Turn/trial-{n}> <https://repolex.ai/ontology/ravel/parentTurn> <{base}ravel/Turn/trial-{}> .\n",
                         n.saturating_sub(1)
                     );
-                    let parser = oxigraph::io::RdfParser::from_format(RdfFormat::NTriples).with_default_graph(g);
-                    store.load_from_reader(parser, nt.as_bytes()).unwrap();
+                    store.load_nt(&nt, Some(&g)).unwrap();
                     store.flush().unwrap();
                     drop(store);
                     n += 1;
@@ -186,7 +272,7 @@ mod tests {
     }
 
     /// One query against a real store, read-only, timed. `RAVEL_TRIAL_STORE`
-    /// is an oxigraph directory, `RAVEL_TRIAL_QUERY` a file, `RAVEL_TRIAL_BASE`
+    /// is a phext store directory, `RAVEL_TRIAL_QUERY` a file, `RAVEL_TRIAL_BASE`
     /// the store's root address.
     #[test]
     #[ignore]
@@ -199,7 +285,7 @@ mod tests {
         eprintln!("OPENED in {:.2}s", t.elapsed().as_secs_f64());
         // `RAVEL_TRIAL_CANCEL_MS`: cancel the query that long after it starts,
         // to show what a cancel does to spareval (see daemon/http.rs `answer`).
-        let stop = oxigraph::sparql::CancellationToken::new();
+        let stop = crate::graph::CancellationToken::new();
         if let Ok(ms) = std::env::var("RAVEL_TRIAL_CANCEL_MS") {
             let (stop, ms) = (stop.clone(), ms.parse::<u64>().unwrap());
             std::thread::spawn(move || {
@@ -270,7 +356,7 @@ mod tests {
 
     fn store() -> Store {
         let s = Store::new().unwrap();
-        s.load_from_reader(RdfFormat::NQuads, DATA.as_bytes()).unwrap();
+        s.load_nq(DATA).unwrap();
         s
     }
 

@@ -344,13 +344,8 @@ fn souls(client: &Client) -> Result<()> {
 /// Memories are stored in UTC; shown in UTC, a late-evening event lands on
 /// the next day (4m41th34's "conscious on 08-04" was 08-03 local).
 fn short(ts: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|t| {
-            t.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|_| ts.get(..16).unwrap_or(ts).replace('T', " "))
+    ravel::time::parse_local_format(ts, "%Y-%m-%d %H:%M")
+        .unwrap_or_else(|| ts.get(..16).unwrap_or(ts).replace('T', " "))
 }
 
 /// Wake lines as OptMem prints them: `#i date text` and `#lo-hi text`.
@@ -792,8 +787,7 @@ fn query(client: &Client, id: &str, q: &str) -> Result<()> {
 /// layout and the examples are what the ontology cannot say, and what a first
 /// query trips on: without `GRAPH`, nothing matches (goodlux, 2026-11-12).
 fn query_help() -> Result<String> {
-    use oxigraph::io::{RdfFormat, RdfParser};
-    use oxigraph::model::{Term, TermRef};
+    use ravel::ttl::{triples, TtlTerm};
     use std::collections::BTreeMap;
     const TTL: &str = include_str!("../../ontology/ravel/ravel.ttl");
     const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -809,30 +803,26 @@ fn query_help() -> Result<String> {
         range: String,
     }
     let mut terms: BTreeMap<String, Term_> = BTreeMap::new();
-    let local = |t: &Term| -> String {
-        match t.as_ref() {
-            TermRef::NamedNode(n) => {
-                let s = n.as_str();
-                s.rsplit(['/', '#']).next().unwrap_or(s).to_string()
-            }
-            TermRef::Literal(l) => l.value().to_string(),
-            _ => String::new(),
+    let local = |t: &TtlTerm| -> String {
+        match t {
+            TtlTerm::Iri(s) => s.rsplit(['/', '#']).next().unwrap_or(s).to_string(),
+            TtlTerm::Literal { value, .. } => value.clone(),
         }
     };
-    for q in RdfParser::from_format(RdfFormat::Turtle).for_slice(TTL.as_bytes()) {
-        let q = q.context("ravel.ttl does not parse")?;
-        let oxigraph::model::NamedOrBlankNode::NamedNode(subj) = &q.subject else {
+    let mut prefixes = std::collections::HashMap::new();
+    for (subj, pred, obj) in triples(TTL, &mut prefixes) {
+        let (TtlTerm::Iri(subj), TtlTerm::Iri(pred)) = (&subj, &pred) else {
             continue;
         };
-        let Some(name) = subj.as_str().strip_prefix(ns) else {
+        let Some(name) = subj.strip_prefix(ns) else {
             continue;
         };
         let e = terms.entry(name.to_string()).or_default();
-        match q.predicate.as_str() {
-            RDF_TYPE => e.kind = local(&q.object),
-            COMMENT => e.comment = local(&q.object),
-            DOMAIN => e.domain = local(&q.object),
-            RANGE => e.range = local(&q.object),
+        match pred.as_str() {
+            RDF_TYPE => e.kind = local(&obj),
+            COMMENT => e.comment = local(&obj),
+            DOMAIN => e.domain = local(&obj),
+            RANGE => e.range = local(&obj),
             _ => {}
         }
     }

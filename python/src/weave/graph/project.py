@@ -2,7 +2,7 @@
 
 Pure stdlib: emitting `.nt` is a streaming string map over the JSONL, no triple
 store needed (N-Triples is itself a one-triple-per-line append-only format, so
-the projection is as cheap as the monolog it reads). pyoxigraph is only needed
+the projection is as cheap as the monolog it reads). the phext evaluator is only needed
 to LOAD and QUERY the result — that lives in `store.py` and is a lazy import.
 
 The RDF 1.2 syntax here is verified against pyoxigraph 0.5.6:

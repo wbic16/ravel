@@ -404,7 +404,81 @@ mod tests {
 pub struct AnthropicApi {
     model: String,
     key: String,
-    http: reqwest::blocking::Client,
+}
+
+/// The tree's one HTTPS call, run by the Python standard library.
+///
+/// reqwest's tree could not pass ashfall, and both in-Rust TLS stacks
+/// were measured and refused (leg D, 2026-11-27): rustls+ring drags a
+/// second `windows-sys` major version (0.52 beside tokio's 0.61), and
+/// native-tls drags `tempfile` — a crate with an audit verdict of
+/// FAIL — plus a second `syn`. The coordinator's ladder therefore
+/// lands on (b): the call moves to Python's stdlib `http` (urllib +
+/// ssl), which is already this repo's backend language. The writer
+/// layer works by subprocess everywhere else too (`claude -p`, the
+/// macOS `security` read above). The API key travels only inside the
+/// request JSON on the helper's stdin — never in argv, never on disk.
+const ANTHROPIC_HELPER_PY: &str = r#"
+import json, sys, urllib.request, urllib.error
+req = json.load(sys.stdin)
+data = json.dumps(req["body"]).encode()
+r = urllib.request.Request(req["url"], data=data, method="POST")
+for k, v in req["headers"].items():
+    r.add_header(k, v)
+try:
+    with urllib.request.urlopen(r, timeout=req["timeout"]) as resp:
+        out = {"status": resp.status, "body": resp.read().decode()}
+except urllib.error.HTTPError as e:
+    out = {"status": e.code, "body": e.read().decode()}
+print(json.dumps(out))
+"#;
+
+/// POST JSON through the helper; returns (status, parsed body).
+fn anthropic_post(key: &str, body: &Value) -> Result<(u16, Value)> {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static HELPER: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let helper = HELPER.get_or_init(|| {
+        let path = std::env::temp_dir().join("ravel-anthropic-helper.py");
+        let _ = std::fs::write(&path, ANTHROPIC_HELPER_PY);
+        path
+    });
+    let request = serde_json::json!({
+        "url": "https://api.anthropic.com/v1/messages",
+        "timeout": 300,
+        "headers": {
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        "body": body,
+    });
+    let mut child = std::process::Command::new("python3")
+        .arg(helper)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("calling the Anthropic API (starting the python3 helper)")?;
+    child
+        .stdin
+        .as_mut()
+        .expect("helper stdin")
+        .write_all(request.to_string().as_bytes())
+        .context("calling the Anthropic API (sending the request)")?;
+    let out = child
+        .wait_with_output()
+        .context("calling the Anthropic API (the helper failed)")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "the Anthropic API helper failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let answer: Value = serde_json::from_slice(&out.stdout)
+        .context("reading the Anthropic API helper's answer")?;
+    let status = answer["status"].as_u64().unwrap_or(0) as u16;
+    let v: Value = serde_json::from_str(answer["body"].as_str().unwrap_or(""))
+        .context("reading the Anthropic API's answer")?;
+    Ok((status, v))
 }
 
 impl AnthropicApi {
@@ -425,9 +499,6 @@ impl AnthropicApi {
         Ok(AnthropicApi {
             model: model.to_string(),
             key,
-            http: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .build()?,
         })
     }
 }
@@ -448,17 +519,12 @@ impl Llm for AnthropicApi {
             // the same 309-byte line back to all twelve "too long" asks.
             "output_config": {"effort": "medium", "format": {"type": "json_schema", "schema": schema}},
         });
-        let res = self
-            .http
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .context("calling the Anthropic API")?;
-        let status = res.status();
-        let v: Value = res.json().context("reading the Anthropic API's answer")?;
-        anyhow::ensure!(status.is_success(), "Anthropic API {status}: {}", v["error"]["message"]);
+        let (status, v) = anthropic_post(&self.key, &body)?;
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "Anthropic API {status}: {}",
+            v["error"]["message"]
+        );
         if v["stop_reason"] == "refusal" {
             anyhow::bail!("the model can't help with this (API refusal: {})", v["stop_details"]);
         }

@@ -1,7 +1,7 @@
 //! Ravel — transcript-graph engine (Rust core).
 //!
 //! Day-39 spike scope: prove the loop end-to-end on real data —
-//!   transcript JSONL → project to RDF 1.2 → load into oxigraph →
+//!   transcript JSONL → project to RDF 1.2 → load into the phext graph store →
 //!   one SPARQL CONSTRUCT detector derives an annotation as a triple term →
 //!   round-trip it back out.
 //!
@@ -17,8 +17,11 @@ pub mod annotate;
 pub mod claude_ai;
 pub mod client;
 pub mod daemon;
+pub mod ed25519;
 pub mod graph;
 pub mod herdr;
+pub mod http_client;
+pub mod time;
 pub mod memory;
 pub mod memory_extract;
 pub mod memory_log;
@@ -31,6 +34,8 @@ pub mod readdress;
 pub mod reader;
 pub mod soul;
 pub mod sync;
+pub mod tessera;
+pub mod ttl;
 pub mod writer;
 
 /// A generic transcript event — the engine's unit. Dialect-agnostic.

@@ -20,4 +20,5 @@
 //! consumer's serving layer that happens to host the transaction
 //! engine (holo-phext) directly.
 
+pub mod http;
 pub mod sparql;

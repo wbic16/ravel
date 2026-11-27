@@ -127,7 +127,7 @@ def test_monolog_to_ntriples_covers_both_readers(tmp_path):
     assert body.count("<<(") >= 2  # at least one reified claim per reader present
 
 
-# --- store round-trip (needs the optional graph extra) -----------------------
+# --- store round-trip (needs the phext-sparql evaluator binary) -------------
 # importorskip must live INSIDE these tests, not at module level: a module-level
 # skip silently disables the pure-stdlib projection tests above too (found
 # 2026-07-02 — the file had been collecting ZERO tests whenever pyoxigraph was
@@ -135,7 +135,9 @@ def test_monolog_to_ntriples_covers_both_readers(tmp_path):
 
 
 def test_bulk_load_and_cross_reader_join(tmp_path):
-    pytest.importorskip("pyoxigraph", reason="graph extra (pyoxigraph) not installed")
+    from weave.graph.store import available
+    if not available():
+        pytest.skip("phext-sparql binary not built (phext/serve, cargo build --release)")
     from weave.graph.store import load_monolog, query
     transcript = _transcript(tmp_path)
     _build_monolog(transcript)
@@ -165,7 +167,9 @@ def test_bulk_load_and_cross_reader_join(tmp_path):
 
 
 def test_rdf12_triple_term_claim_is_queryable(tmp_path):
-    pytest.importorskip("pyoxigraph", reason="graph extra (pyoxigraph) not installed")
+    from weave.graph.store import available
+    if not available():
+        pytest.skip("phext-sparql binary not built (phext/serve, cargo build --release)")
     from weave.graph.store import load_monolog, query
     transcript = _transcript(tmp_path)
     _build_monolog(transcript)

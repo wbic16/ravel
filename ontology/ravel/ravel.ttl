@@ -9,7 +9,7 @@
 # =============================================================================
 # Vocabulary for ravel, the transcript-graph engine: conversations (Claude Code
 # session logs and, later, other harness dialects) projected into RDF 1.2 and
-# stored per soul in `.ravel/_ignore/oxigraph`.
+# stored per soul in `.ravel/_ignore/oxigraph` (directory name kept; the store inside is phext `store.nq` text since the 2026-11-27 rewrite).
 #
 # DISCIPLINE: this file declares ONLY what the code emits today (the pan.ttl
 # law — formalize, don't invent). The wider transcript type-space (attachments,
@@ -178,7 +178,7 @@ ravel:relatedToId a owl:ObjectProperty ;
     rdfs:domain subtexture:Thing ;
     rdfs:range subtexture:Thing .
 
-# Store-scoped NamedGraph descriptors in the Oxigraph store's unnamed graph
+# Store-scoped NamedGraph descriptors in the phext graph store's unnamed graph
 # (https://repolex.ai/{squad}/{user}/ravel/NamedGraph/<id>), using the graph's
 # own IRI as subject (no sd:name). EMITTED since raveld 0.10.0 (ontology
 # 0.9.2): every transcript graph and the memory graph carries its class,

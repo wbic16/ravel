@@ -31,7 +31,7 @@ use crate::memory_extract::Speakers;
 use crate::memory_log::MemoryLog;
 use crate::memory_relive::{self, STRETCH_CHARS};
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Duration as Span, SecondsFormat, Utc};
+use crate::time::Instant;
 use serde::Serialize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -40,18 +40,18 @@ use std::time::Duration;
 /// How often the memory loop looks at each soul.
 pub const MEMORY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Turns this young are not read yet: their conversation may be going on.
-pub const SETTLE: Span = Span::minutes(30);
+pub const SETTLE: Duration = Duration::from_secs(30 * 60);
 /// Turns this old are read even when they do not fill a stretch.
-pub const FLUSH: Span = Span::hours(6);
+pub const FLUSH: Duration = Duration::from_secs(6 * 3600);
 /// Calls one soul may make in one pass before the next soul's turn.
 pub const PASS_CALLS: usize = 60;
 /// A session reader starts over with a fresh wake past this context size:
 /// under Haiku 5.5's 100k-token price tier (the backfill's setting).
 pub const SESSION_TOKENS: u64 = 90_000;
 /// How long every soul waits when the subscription is out of allowance.
-pub const LIMIT_PAUSE: Span = Span::minutes(30);
+pub const LIMIT_PAUSE: Duration = Duration::from_secs(30 * 60);
 /// How long one soul waits after a pass failed for any other reason.
-pub const RETRY_AFTER: Span = Span::hours(1);
+pub const RETRY_AFTER: Duration = Duration::from_secs(3600);
 
 /// What the memory writer last did for one soul, shown on /souls.
 #[derive(Debug, Clone, Serialize, Default)]
@@ -69,7 +69,7 @@ pub struct SoulMemory {
 #[derive(Debug, Default)]
 pub struct MemoryState {
     /// The subscription said it is out of allowance: no calls before this.
-    pub paused_until: Option<DateTime<Utc>>,
+    pub paused_until: Option<Instant>,
     pub paused_why: Option<String>,
     /// A pass is calling the writer for this soul right now.
     pub writing: Option<String>,
@@ -90,9 +90,9 @@ impl Daemon {
             MEMORY_INTERVAL.as_secs() / 60
         );
         match (&st.paused_until, &st.writing) {
-            (Some(t), _) if *t > Utc::now() => format!(
+            (Some(t), _) if *t > Instant::now() => format!(
                 "{base}; PAUSED until {} — {}",
-                t.with_timezone(&chrono::Local).format("%H:%M"),
+                t.format_local("%H:%M"),
                 st.paused_why.as_deref().unwrap_or("")
             ),
             (_, Some(id)) => format!("{base}; writing {id} now"),
@@ -107,7 +107,7 @@ impl Daemon {
         }
         let st = self.memory.lock().unwrap();
         match (&st.paused_until, &st.writing) {
-            (Some(t), _) if *t > Utc::now() => "paused",
+            (Some(t), _) if *t > Instant::now() => "paused",
             (_, Some(_)) => "writing",
             _ => "on",
         }
@@ -128,7 +128,7 @@ impl Daemon {
     fn note(&self, id: &str, f: impl FnOnce(&mut SoulMemory)) {
         if let Ok(mut m) = self.memory.lock() {
             let s = m.souls.entry(id.to_string()).or_default();
-            s.last_pass = Some(chrono::Local::now().to_rfc3339());
+            s.last_pass = Some(crate::time::now_local_rfc3339());
             f(s);
         }
     }
@@ -198,7 +198,7 @@ impl Daemon {
             .await
             .map_err(|e| anyhow!("memory read panicked: {e}"))??
         };
-        let now = Utc::now();
+        let now = Instant::now();
         let to = stamp(now - SETTLE);
         let log_ = MemoryLog::for_soul(&soul.path);
         let (ready, chars, oldest) = memory_relive::unread(&convs, &log_, &to)?;
@@ -214,14 +214,14 @@ impl Daemon {
                 } else {
                     format!(
                         "{waiting} turns younger than {} min, read once they settle",
-                        SETTLE.num_minutes()
+                        SETTLE.as_secs() / 60
                     )
                 });
             });
             return Ok(());
         }
-        let flush_at = DateTime::parse_from_rfc3339(&oldest)
-            .map(|t| t.with_timezone(&Utc) + FLUSH)
+        let flush_at = Instant::parse_rfc3339(&oldest)
+            .map(|t| t + FLUSH)
             .unwrap_or(now);
         if chars < STRETCH_CHARS && flush_at > now {
             self.mark(id);
@@ -230,7 +230,7 @@ impl Daemon {
                 s.last =
                     Some(format!(
                     "{ready} turns ({chars} characters) waiting for a whole stretch, or until {}",
-                    flush_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+                    flush_at.format_local("%Y-%m-%d %H:%M")
                 ));
             });
             return Ok(());
@@ -276,7 +276,7 @@ impl Daemon {
         match &r.stopped {
             Some(why) if crate::writer::is_usage_limit_text(why) => {
                 self.mark(id);
-                let until = Utc::now() + LIMIT_PAUSE;
+                let until = Instant::now() + LIMIT_PAUSE;
                 {
                     let mut m = self.memory.lock().unwrap();
                     m.paused_until = Some(until);
@@ -287,12 +287,12 @@ impl Daemon {
                 });
                 log(format!(
                     "{id}: memory {did}; subscription limit, every soul waits {} min — {why}",
-                    LIMIT_PAUSE.num_minutes()
+                    LIMIT_PAUSE.as_secs() / 60
                 ));
             }
             Some(why) => {
                 self.mark(id);
-                let retry = stamp(Utc::now() + RETRY_AFTER);
+                let retry = stamp(Instant::now() + RETRY_AFTER);
                 self.note(id, |s| {
                     s.last = Some(did.clone());
                     s.error = Some(why.clone());
@@ -330,7 +330,7 @@ pub const REWORD_CALLS: usize = 40;
 
 impl Daemon {
     fn failed(&self, id: &str, e: &anyhow::Error) {
-        let retry = stamp(Utc::now() + RETRY_AFTER);
+        let retry = stamp(Instant::now() + RETRY_AFTER);
         self.note(id, |m| {
             m.error = Some(format!("{e:#}"));
             m.retry_after = Some(retry.clone());
@@ -374,7 +374,7 @@ impl Daemon {
         match &r.stopped {
             Some(why) if crate::writer::is_usage_limit_text(why) => {
                 let mut m = self.memory.lock().unwrap();
-                m.paused_until = Some(Utc::now() + LIMIT_PAUSE);
+                m.paused_until = Some(Instant::now() + LIMIT_PAUSE);
                 m.paused_why = Some(why.clone());
                 drop(m);
                 log(format!("{id}: memory {did}; subscription limit — {why}"));
@@ -414,8 +414,8 @@ pub fn soul_name(path: &std::path::Path) -> String {
 }
 
 /// An instant as the turns write theirs, so the two compare as strings.
-fn stamp(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Secs, true)
+fn stamp(t: Instant) -> String {
+    t.to_rfc3339_secs_z()
 }
 
 /// The memory schedule: write what is due, then project, every soul, every
@@ -451,7 +451,7 @@ async fn write_due(d: &Arc<Daemon>, w: &MemoryWriter) -> Result<()> {
             .lock()
             .unwrap()
             .paused_until
-            .is_some_and(|t| t > Utc::now())
+            .is_some_and(|t| t > Instant::now())
         {
             break;
         }
@@ -463,8 +463,8 @@ async fn write_due(d: &Arc<Daemon>, w: &MemoryWriter) -> Result<()> {
         let waits = d
             .memory_of(&s.id)
             .retry_after
-            .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
-            .is_some_and(|t| t > Utc::now());
+            .and_then(|t| Instant::parse_rfc3339(&t))
+            .is_some_and(|t| t > Instant::now());
         if waits {
             continue;
         }
@@ -482,7 +482,7 @@ async fn write_due(d: &Arc<Daemon>, w: &MemoryWriter) -> Result<()> {
             .lock()
             .unwrap()
             .paused_until
-            .is_some_and(|t| t > Utc::now());
+            .is_some_and(|t| t > Instant::now());
         if reword && !paused && !d.stopping.load(Ordering::Relaxed) {
             if let Err(e) = d.reword_one(&s.id, w).await {
                 d.failed(&s.id, &e);

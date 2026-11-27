@@ -1,4 +1,4 @@
-//! Project `Annotation`s into oxigraph as RDF 1.2 (oa: + prov: + triple terms).
+//! Project `Annotation`s into the phext graph store as RDF 1.2 (oa: + prov: + triple terms).
 //!
 //! This is the Rust port of the proven Python `graph/project.py` annotation
 //! layer. The shape (verified green in the lab):
@@ -30,11 +30,11 @@
 //! re-projecting the same findings overwrites rather than duplicating — the
 //! w4r3z idempotency discipline, carried into the annotation IRIs.
 
-use crate::reader::Annotation;
+use crate::graph::Store;
 use crate::names::Names;
+use crate::reader::Annotation;
 use crate::RAVEL_NS;
 use anyhow::Result;
-use oxigraph::store::Store;
 use sha2::{Digest, Sha256};
 
 const OA: &str = "http://www.w3.org/ns/oa#";
@@ -85,13 +85,13 @@ pub fn project_annotations(
 ) -> Result<Store> {
     let store = Store::new()?;
     let nt = annotation_nt(anns, transcript_id, names)?;
-    store.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
+    store.load_nt(&nt, None)?;
     Ok(store)
 }
 
 /// Build the N-Triples for a set of annotations (no store). Split out so the
 /// persistent-graph arm can retarget these into a per-transcript NAMED graph via
-/// `RdfParser::with_default_graph` — same triples, different graph home.
+/// Loaded with a default graph — same triples, different graph home.
 pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, names: &Names) -> Result<String> {
     let mut nt = String::new();
     let base = names.base();
@@ -346,10 +346,9 @@ fn safe(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{eval_query, QueryResults};
     use crate::reader::emojikey_read;
     use crate::Event;
-    use oxigraph::model::GraphName;
-    use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 
     fn ev(id: &str, text: &str) -> Event {
         let span = crate::TextSpan {
@@ -410,15 +409,8 @@ mod tests {
 
         // round-trip through a fresh store, reading back THROUGH the triple term
         let store2 = Store::new().unwrap();
-        let dump = store
-            .dump_to_writer(
-                oxigraph::io::RdfSerializer::from_format(oxigraph::io::RdfFormat::NQuads),
-                Vec::new(),
-            )
-            .unwrap();
-        store2
-            .load_from_reader(oxigraph::io::RdfFormat::NQuads, dump.as_slice())
-            .unwrap();
+        let dump = store.dump_nquads();
+        store2.load_nq(&dump).unwrap();
 
         let q = format!(
             r#"
@@ -435,12 +427,7 @@ mod tests {
             }}
             "#
         );
-        let res = SparqlEvaluator::new()
-            .parse_query(&q)
-            .unwrap()
-            .on_store(&store2)
-            .execute()
-            .unwrap();
+        let res = eval_query(&store2, &q).unwrap();
         let QueryResults::Solutions(sols) = res else {
             panic!("expected solutions")
         };
@@ -452,7 +439,6 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 1, "exactly one emojikey detection should round-trip");
-        let _ = GraphName::DefaultGraph; // keep import honest if unused above
     }
 
     #[test]
@@ -477,8 +463,7 @@ mod tests {
             }
         };
         let anns = vec![mk(3), mk(8)];
-        let store =
-            project_annotations(&anns, "trans-num", &crate::names::Names::bare()).unwrap();
+        let store = project_annotations(&anns, "trans-num", &crate::names::Names::bare()).unwrap();
 
         // NUMERIC filter: legs projected as plain strings would compare
         // lexically ("8" < "3" is false but "10" < "3" is TRUE lexically) — a
@@ -488,12 +473,7 @@ mod tests {
                SELECT (COUNT(*) AS ?big) WHERE {{
                  ?body ravel:sig_magnitude ?m . FILTER(?m > 5) }}"#
         );
-        let res = SparqlEvaluator::new()
-            .parse_query(&q)
-            .unwrap()
-            .on_store(&store)
-            .execute()
-            .unwrap();
+        let res = eval_query(&store, &q).unwrap();
         let QueryResults::Solutions(sols) = res else {
             panic!("expected solutions")
         };
@@ -514,15 +494,7 @@ mod tests {
         );
 
         // and the datatype is genuinely xsd:integer on the wire
-        let dump = String::from_utf8(
-            store
-                .dump_to_writer(
-                    oxigraph::io::RdfSerializer::from_format(oxigraph::io::RdfFormat::NQuads),
-                    Vec::new(),
-                )
-                .unwrap(),
-        )
-        .unwrap();
+        let dump = store.dump_nquads();
         assert!(
             dump.contains("XMLSchema#integer"),
             "numeric leg must carry an xsd:integer datatype on the wire"

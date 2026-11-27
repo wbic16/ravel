@@ -14,7 +14,7 @@
 //!    harness dir — is what gets ingested, so the graph and the bytes it was
 //!    derived from can never drift apart.
 //!
-//! 2. **Ingest** — project the mirror into `<repo>/.ravel/_ignore/oxigraph`.
+//! 2. **Ingest** — project the mirror into the phext graph store at `<repo>/.ravel/_ignore/oxigraph` (directory name kept from the pre-rewrite layout; the store inside it is now `store.nq` text).
 //!    Turn-keyed IRIs + per-transcript named-graph replace make re-runs cheap
 //!    and safe (only new turns add triples).
 //!
@@ -395,12 +395,12 @@ fn read_unread(path: &Path, from: u64) -> Result<Unread> {
 /// leaves it out. The store says which graph holds a turn, so no other record
 /// of ownership is kept.
 fn owned_here(
-    store: &oxigraph::store::Store,
+    store: &crate::graph::Store,
     names: &crate::names::Names,
     id: &str,
     events: Vec<crate::Event>,
 ) -> Result<Vec<crate::Event>> {
-    use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNodeRef, TermRef};
+    use crate::graph::{GraphName, NamedNode, NamedOrBlankNodeRef, TermRef};
     let here = NamedNode::new(graph::transcript_graph_iri(names, id))?;
     let rdf_type = NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")?;
     let turn = NamedNode::new(format!("{}Turn", crate::RAVEL_NS))?;
@@ -877,7 +877,7 @@ fn mtime_nanos(p: &Path) -> u128 {
 fn sync_agy_one(
     c: &AgyConversation,
     mirror: &Path,
-    store: &oxigraph::store::Store,
+    store: &crate::graph::Store,
     names: &crate::names::Names,
     manifest: &mut std::collections::HashMap<String, String>,
     st: &mut AgyStats,
@@ -1070,10 +1070,10 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
     if mirror.is_dir() {
         let fresh = tsv_is_stale(&repo.join(INGEST_MANIFEST));
         let names = crate::names::Names::for_soul(repo)?;
-    let store = crate::readdress::open_current(repo, &names)?;
-    // A store that has never listed its newest turns does so now, even
-    // when this pass brings it nothing new.
-    graph::keep_recent(&store, &names, &[])?;
+        let store = crate::readdress::open_current(repo, &names)?;
+        // A store that has never listed its newest turns does so now, even
+        // when this pass brings it nothing new.
+        graph::keep_recent(&store, &names, &[])?;
         let mut manifest = read_manifest(repo);
         // Owners first: a turn belongs to the first file that brings it in,
         // so sessions load before their subagents, and older before newer,
@@ -1095,7 +1095,7 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
                     continue;
                 };
                 let id = rel.to_string_lossy().trim_end_matches(".jsonl").to_string();
-                let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(&names, &id))?;
+                let g = crate::graph::NamedNode::new(graph::transcript_graph_iri(&names, &id))?;
                 graph::drop_graph(&store, &g)?;
             }
         }
@@ -1120,7 +1120,7 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
             if manifest.get(&name) != Some(&len) {
                 if let Some(current) = superseded_by(&path) {
                     let id = name.trim_end_matches(".jsonl");
-                    let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(&names, id))?;
+                    let g = crate::graph::NamedNode::new(graph::transcript_graph_iri(&names, id))?;
                     graph::drop_graph(&store, &g)?;
                     eprintln!(
                         "[raveld] {name}: an older copy of {}, left out of the store",
@@ -1439,9 +1439,7 @@ pub fn sync_claude_ai(repo: &Path) -> Result<ClaudeAiStats> {
         if !events.is_empty() {
             let anns = reader::emojikey_read(&events);
             let graph_id = format!("claude-ai-{id}");
-            if let Err(err) =
-                graph::ingest_transcript(&store, &events, &anns, &graph_id, &names)
-            {
+            if let Err(err) = graph::ingest_transcript(&store, &events, &anns, &graph_id, &names) {
                 st.failed.push(format!("{id}: {err:#}"));
                 continue;
             }
@@ -1937,11 +1935,11 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
 
     // Store — read-only look, never create.
     let store_dir = repo.join(STORE_SUBDIR);
-    if !store_dir.join("CURRENT").exists() {
+    if !store_dir.join(crate::graph::STORE_FILE).exists() {
         push(
             true,
             format!(
-                "store: {} is not an oxigraph store (no CURRENT) — mirror exists but nothing is ingested; run `ravel sync {}`",
+                "store: {} is not a phext store (no store.nq) — mirror exists but nothing is ingested; run `ravel sync {}`",
                 store_dir.display(),
                 repo.display()
             ),
@@ -1950,13 +1948,8 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
         let _hold = graph::reading(&store_dir);
         let store = graph::open_read_only(&store_dir)?;
         let count = |q: &str| -> Result<String> {
-            use oxigraph::model::Term;
-            use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-            if let QueryResults::Solutions(mut sols) = SparqlEvaluator::new()
-                .parse_query(q)?
-                .on_store(&store)
-                .execute()?
-            {
+            use crate::graph::{QueryResults, Term};
+            if let QueryResults::Solutions(mut sols) = graph::eval_query(&store, q)? {
                 if let Some(s) = sols.next() {
                     if let Some((_, t)) = s?.iter().next() {
                         // lexical form only — "11994", not "11994"^^xsd:integer
@@ -2513,7 +2506,11 @@ mod tests {
         let mut got: Vec<_> = mine.iter().map(|c| c.id.clone()).collect();
         got.sort();
         assert_eq!(got, vec![theirs, their_child]);
-        assert_eq!(unattributed, vec![orphan, lost], "the same list for every soul");
+        assert_eq!(
+            unattributed,
+            vec![orphan, lost],
+            "the same list for every soul"
+        );
         fs::remove_dir_all(&base).ok();
     }
 
@@ -2524,7 +2521,12 @@ mod tests {
     fn real_agy_owners() {
         let repo = PathBuf::from(std::env::var("RAVEL_TRIAL_REPO").expect("RAVEL_TRIAL_REPO"));
         let (mine, unattributed) = agy_conversations_for(&repo).unwrap();
-        println!("{}: {} conversation(s); {} on disk belong to no soul", repo.display(), mine.len(), unattributed.len());
+        println!(
+            "{}: {} conversation(s); {} on disk belong to no soul",
+            repo.display(),
+            mine.len(),
+            unattributed.len()
+        );
     }
 
     /// `history.jsonl` is the agy analogue of the claude path slug: rows carry
@@ -2651,14 +2653,20 @@ mod tests {
         fs::create_dir_all(&mirror).unwrap();
         let source = dir.join("transcript_full.jsonl");
         let row = |i: u64, text: &str| {
-            format!(r#"{{"step_index":{i},"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","created_at":"2026-11-22T14:00:{i:02}Z","content":"{text}"}}"#) + "\n"
+            format!(
+                r#"{{"step_index":{i},"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","created_at":"2026-11-22T14:00:{i:02}Z","content":"{text}"}}"#
+            ) + "\n"
         };
         fs::write(&source, row(0, "one") + &row(1, "two")).unwrap();
-        let c = AgyConversation { id: "conv".into(), source: source.clone(), short_only: false };
-        let store = oxigraph::store::Store::new().unwrap();
+        let c = AgyConversation {
+            id: "conv".into(),
+            source: source.clone(),
+            short_only: false,
+        };
+        let store = crate::graph::Store::new().unwrap();
         let names = crate::names::Names::new("7r1pl3f0rc3", "kira").unwrap();
         let mut manifest = std::collections::HashMap::new();
-        let turns = |store: &oxigraph::store::Store| {
+        let turns = |store: &crate::graph::Store| {
             graph::query_rows(store, "SELECT ?t ?x ?p WHERE { GRAPH ?g { ?t <https://repolex.ai/ontology/ravel/text> ?x OPTIONAL { ?t <https://repolex.ai/ontology/ravel/parentTurn> ?p } } } ORDER BY ?t").unwrap()
         };
         let pass = |manifest: &mut std::collections::HashMap<String, String>| {
@@ -2683,11 +2691,21 @@ mod tests {
         let rows = turns(&store);
         assert_eq!(rows.len(), 4, "{rows:?}");
         let third = rows.iter().find(|r| r["x"] == "three").unwrap();
-        assert!(third["p"].ends_with(&crate::agy::turn_id("conv", 1)), "{third:?}");
-        assert_eq!(fs::read(&source).unwrap(), fs::read(mirror.join("conv.jsonl")).unwrap());
+        assert!(
+            third["p"].ends_with(&crate::agy::turn_id("conv", 1)),
+            "{third:?}"
+        );
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            fs::read(mirror.join("conv.jsonl")).unwrap()
+        );
 
         // An earlier line rewritten: the whole conversation is loaded again.
-        fs::write(&source, row(0, "one") + &row(1, "TWO") + &row(2, "three") + &row(3, "four")).unwrap();
+        fs::write(
+            &source,
+            row(0, "one") + &row(1, "TWO") + &row(2, "three") + &row(3, "four"),
+        )
+        .unwrap();
         let st = pass(&mut manifest);
         assert_eq!((st.sessions, st.turns), (1, 4));
         let rows = turns(&store);

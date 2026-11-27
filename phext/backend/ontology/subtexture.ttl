@@ -35,7 +35,7 @@
 #
 # v0.6.0 (2026-11-19, ruled by goodlux): NAMED GRAPH DESCRIPTORS & ACCESS METADATA.
 #   (1) Store-scoped NamedGraph IRIs (https://repolex.ai/{squad}/{user}/{app}/NamedGraph/{id}):
-#       every named graph descriptor lives in its Oxigraph store's unnamed graph
+#       every named graph descriptor lives in its phext graph store's unnamed graph
 #       with the graph's own IRI as subject (no sd:name indirection).
 #   (2) Structural classes under `subtexture:NamedGraph`:
 #       + `subtexture:OntologyGraph` — T-box ontology graphs (left unrewritten
@@ -290,7 +290,7 @@ subtexture:parameter a owl:DatatypeProperty ;
 # =============================================================================
 # 4. GRAPHS & ACCESS METADATA
 # =============================================================================
-# Every Oxigraph store's unnamed graph holds one descriptor per named graph in
+# Every phext graph store's unnamed graph holds one descriptor per named graph in
 # that store, using the store-scoped graph IRI itself as subject
 # (`https://repolex.ai/{squad}/{user}/{app}/NamedGraph/{id}`, no sd:name).
 # Structural role is expressed by subclassing (`OntologyGraph`, `DefaultGraph`);

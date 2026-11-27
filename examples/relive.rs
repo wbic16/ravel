@@ -96,8 +96,8 @@ fn main() -> Result<()> {
             let sp = speakers(&repo, &cfg);
             let convs = ravel::memory_relive::load(&repo, &sp, &peer_index(&cfg))?;
             let log = MemoryLog::for_soul(&repo);
-            let settled = (chrono::Utc::now() - ravel::daemon::memory::SETTLE)
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let settled = (ravel::time::Instant::now() - ravel::daemon::memory::SETTLE)
+                .to_rfc3339_secs_z();
             let (n, chars, oldest) = ravel::memory_relive::unread(&convs, &log, &settled)?;
             let (all, _, _) = ravel::memory_relive::unread(&convs, &log, "9999")?;
             println!("{n} settled turns unread ({chars} characters, oldest {oldest}); {all} unread in all");
